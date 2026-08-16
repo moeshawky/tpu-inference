@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import torch
 import vllm.envs as vllm_envs
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -46,7 +47,7 @@ from tpu_inference.layers.common.quant_methods import UNQUANTIZED
 from tpu_inference.layers.common.quantization import \
     unquantized as common_unquantized
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context, general_device_put
+from tpu_inference.layers.common.utils import general_device_put
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
@@ -64,17 +65,26 @@ P = PartitionSpec
 logger = init_logger(__name__)
 
 
+def _host_numpy_from_torch(tensor: torch.Tensor):
+    """Convert a CPU torch tensor to an independent host numpy array.
+
+    bfloat16 has no native numpy dtype, so bit-cast through uint8 and view with
+    ml_dtypes.bfloat16. This avoids torchax t2j's bf16->float32 upcast (2x
+    memory) so large weights (e.g. the 2.37GiB embedding) stay small on host.
+    """
+    t = tensor.detach().cpu()
+    if t.dtype == torch.bfloat16 and t.is_contiguous() and t.dim():
+        raw = t.view(torch.uint8).numpy()
+        return raw.view(ml_dtypes.bfloat16).copy()
+    return t.numpy()
+
+
 def _load_weight_for_layer(
     layer: torch.nn.Module,
     param_name: str,
     sharding: NamedSharding,
 ) -> jax.Array:
     """Load a layer's weight parameter onto the TPU mesh.
-    The non-Pathways (ordinary) path previously converted the PyTorch tensor
-    to a JAX array without enforcing a CPU context; this caused an
-    implicit placement on the default device and an unsharded 4+GiB
-    allocation on a single chip. To avoid that, convert under a CPU mesh
-    and then scatter directly to the requested sharding.
     """
     tensor = getattr(layer, param_name)
 
@@ -106,11 +116,21 @@ def _load_weight_for_layer(
             tensor = new_param
 
     if not vllm_envs.VLLM_TPU_USING_PATHWAYS:
-        # Convert to JAX under the CPU mesh so the intermediate lives on host RAM.
-        with cpu_mesh_context():
-            cpu_tensor = t2j(tensor, use_dlpack=False)
-        # Scatter directly from the CPU mesh into the destination sharding.
-        return general_device_put(cpu_tensor, sharding, source_mesh=cpu_mesh())
+        # Direct host->sharded transfer. torchax t2j() instead materializes a
+        # device array (replicated under the global mesh; bf16 upcast to
+        # float32 = 2x memory), which general_device_put then reshards via
+        # JAX's shard_sharded_device_array_slow_path: a full device->host copy
+        # of the whole weight re-mapped through VFIO. On this box
+        # dma_entry_limit=65535 with no hugepages, a single ~4GiB DMA mapping
+        # fails with RESOURCE_EXHAUSTED (ioctl ENOMEM). Keeping the weight on
+        # host and device_put-ing with the target sharding shards on host and
+        # transfers each shard, avoiding the large mapping.
+        try:
+            np_tensor = _host_numpy_from_torch(tensor)
+        except TypeError:
+            # numpy-unsupported dtype (e.g. fp8): fall back to torchax t2j.
+            return t2j(tensor, use_dlpack=False)
+        return jax.device_put(np_tensor, sharding)
 
     if is_pathways_dummy_load():
         # Dummy weights are created directly on the TPU mesh, no CPU→TPU transfer needed
@@ -180,8 +200,7 @@ class VllmUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
                                         P(ShardingAxisName.MLP_TENSOR, None))
         weight = _load_weight_for_layer(layer, "weight", weight_sharding)
         delattr(layer, 'weight')
-        # _load_weight_for_layer already places onto the requested sharding
-        # for the ordinary non-Pathways path. Avoid duplicative device_put.
+        weight = general_device_put(weight, weight_sharding)
 
         is_pooling = get_current_vllm_config(
         ).model_config.runner_type == "pooling"
@@ -198,7 +217,7 @@ class VllmUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
                                           P(ShardingAxisName.MLP_TENSOR))
             bias = _load_weight_for_layer(layer, "bias", bias_sharding)
             delattr(layer, 'bias')
-            # _load_weight_for_layer already placed bias onto the target sharding.
+            bias = general_device_put(bias, bias_sharding)
 
             if is_pooling:
                 layer.__dict__.pop("bias", None)

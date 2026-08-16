@@ -178,4 +178,63 @@ def _shard_column_linear_lora(layer: ColumnParallelLinearWithLoRA,
     layer.lora_a_stacked = sharded_lora_a_tpu
     layer.lora_b_stacked = sharded_lora_b_tpu
 
-# (rest of file unchanged)
+
+def _shard_qkv_linear_lora(layer: ColumnParallelLinearWithLoRA,
+                           mesh: Mesh) -> None:
+    _shard_column_linear_lora(layer, mesh)
+
+
+def _shard_merged_column_parallel_linear_lora(
+        layer: MergedColumnParallelLinearWithLoRA, mesh: Mesh) -> None:
+    _shard_column_linear_lora(layer, mesh)
+
+
+def _shard_merged_qkv_parallel_linear_lora(
+        layer: MergedQKVParallelLinearWithLoRA, mesh: Mesh) -> None:
+    _shard_column_linear_lora(layer, mesh)
+
+
+def _shard_row_parallel_linear_lora(layer: RowParallelLinearWithLoRA,
+                                    mesh: Mesh) -> None:
+    _shard_base_linear_lora_replicated(layer, mesh)
+
+
+def _replicate_fused_moe_hash_indices_tables_and_e_score_correction_bias(
+        module: torch.nn.Module, mesh: Mesh) -> None:
+    if isinstance(module, RoutedExperts):
+        table = getattr(module, "hash_indices_table", None)
+        if table is not None:
+            sharded = _shard_tensor_to_tpu_replicated(table, mesh)
+            module.hash_indices_table = torch.nn.Parameter(sharded,
+                                                           requires_grad=False)
+        e_score_correction_bias = getattr(module, "e_score_correction_bias",
+                                          None)
+        if e_score_correction_bias is not None:
+            sharded = _shard_tensor_to_tpu_replicated(e_score_correction_bias,
+                                                      mesh)
+            module.e_score_correction_bias = torch.nn.Parameter(
+                sharded, requires_grad=False)
+
+
+# NOTE: Ordering is important as it calls first matched type of a given module
+MODULE_TYPE_TO_SHARDING_FUNC = [
+    # Shard LoRA layers
+    (ColumnParallelLinearWithLoRA, _shard_column_linear_lora),
+    (QKVParallelLinearWithLoRA, _shard_qkv_linear_lora),
+    (MergedColumnParallelLinearWithLoRA,
+     _shard_merged_column_parallel_linear_lora),
+    (MergedQKVParallelLinearWithLoRA, _shard_merged_qkv_parallel_linear_lora),
+    (RowParallelLinearWithLoRA, _shard_row_parallel_linear_lora),
+    (ReplicatedLinearWithLoRA, _shard_base_linear_lora_replicated),
+]
+
+
+def _shard_module_to_tpu(model: torch.nn.Module, mesh: Mesh) -> None:
+    for path, module in model.named_modules():
+        _replicate_fused_moe_hash_indices_tables_and_e_score_correction_bias(
+            module, mesh)
+        for module_type, sharding_func in MODULE_TYPE_TO_SHARDING_FUNC:
+            if type(module) is module_type:
+                logger.debug("shard %s with %s", path, sharding_func)
+                sharding_func(module, mesh)
+                break

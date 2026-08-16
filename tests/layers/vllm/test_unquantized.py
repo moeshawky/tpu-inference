@@ -816,3 +816,39 @@ def test_load_weight_for_layer_pathways_dummy(_, dtype):
     assert result.dtype == to_jax_dtype(dtype)
     # The original tensor's storage should have been freed
     assert layer.weight.untyped_storage().size() == 0
+
+def test_release_cpu_storage_resizable():
+    from tpu_inference.layers.vllm.quantization.unquantized import _release_cpu_storage
+    t = torch.randn((10, 10))
+    _release_cpu_storage(t)
+    assert t.untyped_storage().size() == 0
+
+def test_release_cpu_storage_non_resizable():
+    from tpu_inference.layers.vllm.quantization.unquantized import _release_cpu_storage
+
+    # We use a mock storage to simulate exactly the safetensors error.
+    # Safetensors loads return tensors where resize_ fails.
+    # A simple way to get that error exactly in pure pytorch is trickier depending on the version.
+    # Instead, we just mock the tensor.untyped_storage to raise the exact error string.
+    from unittest.mock import MagicMock
+
+    t = MagicMock()
+    t.untyped_storage.return_value.resize_.side_effect = RuntimeError(
+        "Trying to resize storage that is not resizable"
+    )
+
+    # This should not raise
+    _release_cpu_storage(t)
+
+def test_release_cpu_storage_unrelated_runtime_error():
+    from tpu_inference.layers.vllm.quantization.unquantized import _release_cpu_storage
+    from unittest.mock import MagicMock
+
+    t = MagicMock()
+    t.untyped_storage.return_value.resize_.side_effect = RuntimeError(
+        "Some other unrelated storage failure"
+    )
+
+    import pytest
+    with pytest.raises(RuntimeError, match="Some other unrelated storage failure"):
+        _release_cpu_storage(t)

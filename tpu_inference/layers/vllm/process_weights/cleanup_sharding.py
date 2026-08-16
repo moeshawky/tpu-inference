@@ -29,6 +29,7 @@ from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 
 from tpu_inference.layers.common.utils import general_device_put
+from tpu_inference.layers.vllm.quantization.unquantized import _release_cpu_storage
 from tpu_inference.logger import init_logger
 from tpu_inference.models.common.pathways_dummy_loader import (
     create_dummy_weights_on_tpu, is_pathways_dummy_load)
@@ -97,7 +98,7 @@ def _convert_to_torchax_and_shard(tensor: torch.Tensor,
     if vllm_envs.VLLM_TPU_USING_PATHWAYS and isinstance(tensor, torch.Tensor):
         if is_pathways_dummy_load():
             # Generate random values directly on TPU.
-            tensor.untyped_storage().resize_(0)
+            _release_cpu_storage(tensor)
             return torch_view(
                 create_dummy_weights_on_tpu(
                     sharding=sharding,

@@ -46,7 +46,7 @@ from tpu_inference.layers.common.quant_methods import UNQUANTIZED
 from tpu_inference.layers.common.quantization import \
     unquantized as common_unquantized
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.common.utils import general_device_put
+from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context, general_device_put
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
@@ -70,6 +70,11 @@ def _load_weight_for_layer(
     sharding: NamedSharding,
 ) -> jax.Array:
     """Load a layer's weight parameter onto the TPU mesh.
+    The non-Pathways (ordinary) path previously converted the PyTorch tensor
+    to a JAX array without enforcing a CPU context; this caused an
+    implicit placement on the default device and an unsharded 4+GiB
+    allocation on a single chip. To avoid that, convert under a CPU mesh
+    and then scatter directly to the requested sharding.
     """
     tensor = getattr(layer, param_name)
 
@@ -101,7 +106,11 @@ def _load_weight_for_layer(
             tensor = new_param
 
     if not vllm_envs.VLLM_TPU_USING_PATHWAYS:
-        return t2j(tensor, use_dlpack=False)
+        # Convert to JAX under the CPU mesh so the intermediate lives on host RAM.
+        with cpu_mesh_context():
+            cpu_tensor = t2j(tensor, use_dlpack=False)
+        # Scatter directly from the CPU mesh into the destination sharding.
+        return general_device_put(cpu_tensor, sharding, source_mesh=cpu_mesh())
 
     if is_pathways_dummy_load():
         # Dummy weights are created directly on the TPU mesh, no CPU→TPU transfer needed
@@ -171,7 +180,9 @@ class VllmUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
                                         P(ShardingAxisName.MLP_TENSOR, None))
         weight = _load_weight_for_layer(layer, "weight", weight_sharding)
         delattr(layer, 'weight')
-        weight = general_device_put(weight, weight_sharding)
+        # _load_weight_for_layer already places onto the requested sharding
+        # for the ordinary non-Pathways path. Avoid duplicative device_put.
+
         is_pooling = get_current_vllm_config(
         ).model_config.runner_type == "pooling"
 
@@ -187,7 +198,7 @@ class VllmUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
                                           P(ShardingAxisName.MLP_TENSOR))
             bias = _load_weight_for_layer(layer, "bias", bias_sharding)
             delattr(layer, 'bias')
-            bias = general_device_put(bias, bias_sharding)
+            # _load_weight_for_layer already placed bias onto the target sharding.
 
             if is_pooling:
                 layer.__dict__.pop("bias", None)

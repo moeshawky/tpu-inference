@@ -50,7 +50,7 @@ from tpu_inference.layers.common.utils import cpu_mesh, cpu_mesh_context, genera
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
-    _tensor_is_in_cpu
+    _tensor_is_in_cpu, _release_cpu_storage
 from tpu_inference.layers.vllm.quantization.base import VllmQuantizationMethod
 from tpu_inference.layers.vllm.quantization.configs import (
     VllmQuantConfig, VllmQuantLinearConfig)
@@ -116,7 +116,7 @@ def _load_weight_for_layer(
         # Dummy weights are created directly on the TPU mesh, no CPU→TPU transfer needed
         tensor_shape = tuple(tensor.shape)
         tensor_dtype = tensor.dtype
-        tensor.untyped_storage().resize_(0)
+        _release_cpu_storage(tensor)
         dtype = to_jax_dtype(tensor_dtype)
         return create_dummy_weights_on_tpu(
             sharding=sharding,
@@ -239,7 +239,7 @@ class VllmUnquantizedLinearMethod(vllm_linear.UnquantizedLinearMethod,
         weight = jnp.transpose(weight)
 
         # Free CPU memory immediately
-        layer.weight.untyped_storage().resize_(0)
+        _release_cpu_storage(layer.weight)
         delattr(layer, 'weight')
         if layer.bias is not None and not layer.skip_bias_add:
             if layer.return_bias:
@@ -247,7 +247,7 @@ class VllmUnquantizedLinearMethod(vllm_linear.UnquantizedLinearMethod,
             bias_sharding = NamedSharding(self.linear_config.mesh,
                                           self.linear_config.bias_sharding)
             bias = _load_weight_for_layer(layer, "bias", bias_sharding)
-            layer.bias.untyped_storage().resize_(0)
+            _release_cpu_storage(layer.bias)
             delattr(layer, 'bias')
         else:
             bias = None
@@ -370,16 +370,16 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
         w13_weight = _load_weight_for_layer(layer, "w13_weight", ep_sharding)
         w2_weight = _load_weight_for_layer(layer, "w2_weight", ep_sharding)
         # Free CPU memory immediately
-        layer.w13_weight.untyped_storage().resize_(0)
-        layer.w2_weight.untyped_storage().resize_(0)
+        _release_cpu_storage(layer.w13_weight)
+        _release_cpu_storage(layer.w2_weight)
         delattr(layer, 'w13_weight')
         delattr(layer, 'w2_weight')
 
         if self.moe.has_bias:
             w13_bias = _load_weight_for_layer(layer, "w13_bias", ep_sharding)
             w2_bias = _load_weight_for_layer(layer, "w2_bias", ep_sharding)
-            layer.w13_bias.untyped_storage().resize_(0)
-            layer.w2_bias.untyped_storage().resize_(0)
+            _release_cpu_storage(layer.w13_bias)
+            _release_cpu_storage(layer.w2_bias)
             delattr(layer, 'w13_bias')
             delattr(layer, 'w2_bias')
         else:

@@ -770,7 +770,7 @@ def _make_layer_with_weight(shape, dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @patch("vllm.envs.VLLM_TPU_USING_PATHWAYS", False)
 def test_load_weight_for_layer_non_pathways(dtype):
-    """_load_weight_for_layer falls back to t2j when not using Pathways."""
+    """_load_weight_for_layer directly honors the target sharding."""
     layer = _make_layer_with_weight((4, 8), dtype)
     mesh = test_utils.get_spmd_mesh(1)
     sharding = NamedSharding(mesh, P(None, None))
@@ -778,6 +778,7 @@ def test_load_weight_for_layer_non_pathways(dtype):
     expected = t2j(layer.weight, use_dlpack=False)
     assert result.shape == expected.shape
     assert result.dtype == expected.dtype
+    assert result.sharding == sharding
     import numpy as np
     np.testing.assert_array_equal(np.asarray(result), np.asarray(expected))
 

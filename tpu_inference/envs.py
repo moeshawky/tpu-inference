@@ -83,6 +83,9 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
+    MOE_EXPERT_OFFLOAD: bool = False
+    MOE_EXPERT_OFFLOAD_SLOTS: int = 16
+    MOE_EXPERT_OFFLOAD_LAYERS: str = ""
 
 
 def env_with_choices(
@@ -486,6 +489,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Currently, it only supports a single host set up.
     "TPU_MESH_SORT_BY_COORDS":
     env_bool("TPU_MESH_SORT_BY_COORDS", default=False),
+    # Host-backed MoE expert offload (static S-slot device cache; full bank
+    # lives in host RAM). MOE_EXPERT_OFFLOAD_LAYERS="" enables all MoE layers.
+    "MOE_EXPERT_OFFLOAD":
+    env_bool("MOE_EXPERT_OFFLOAD", default=False),
+    "MOE_EXPERT_OFFLOAD_SLOTS":
+    lambda: int(os.getenv("MOE_EXPERT_OFFLOAD_SLOTS", "16")),
+    "MOE_EXPERT_OFFLOAD_LAYERS":
+    lambda: os.getenv("MOE_EXPERT_OFFLOAD_LAYERS", ""),
     # Controls whether FP8 linear and MoE layers perform incremental weight
     # loading, sharding, and immediate host RAM cleanup. When enabled, weights
     # are sharded and transferred to TPU device memory layer-by-layer (or per

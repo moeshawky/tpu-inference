@@ -50,6 +50,7 @@ from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.utils import general_device_put
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
+from tpu_inference.layers.vllm import expert_offload
 from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
     _tensor_is_in_cpu, _release_cpu_storage
 from tpu_inference.layers.vllm.quantization.base import VllmQuantizationMethod
@@ -355,6 +356,14 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
 
         TpuFusedMoEMethodBase.__init__(self, self.moe_backend, ep_axis_name)
 
+    def _gmm_tp_w13_sharding(self) -> NamedSharding:
+        """GMM_TP w13 layout: shard the last (MLP_TENSOR) axis."""
+        return NamedSharding(self.mesh, P(None, None, ShardingAxisName.MLP_TENSOR))
+
+    def _gmm_tp_w2_sharding(self) -> NamedSharding:
+        """GMM_TP w2 layout: shard the middle (MLP_TENSOR) axis."""
+        return NamedSharding(self.mesh, P(None, ShardingAxisName.MLP_TENSOR, None))
+
     @property
     def is_monolithic(self) -> bool:
         return True
@@ -413,6 +422,20 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
                                                   w2_bias=w2_bias)
 
         del w13_weight, w2_weight, w13_bias, w2_bias
+
+        if (expert_offload.layer_enabled(layer.layer_name)
+                and not self.moe.has_bias):
+            # Host-backed expert offload: register the full host bank and keep
+            # only the initial S-slot bank on device. Skip full shard_moe_weights.
+            bank = expert_offload.register_bank(
+                layer.layer_name, weights.w13_weight, weights.w2_weight,
+                self._gmm_tp_w13_sharding(), self._gmm_tp_w2_sharding())
+            layer.w13_weight = Parameter(torch_view(bank.slot_w13),
+                                         requires_grad=False)
+            layer.w2_weight = Parameter(torch_view(bank.slot_w2),
+                                        requires_grad=False)
+            jax.effects_barrier()
+            return
 
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))

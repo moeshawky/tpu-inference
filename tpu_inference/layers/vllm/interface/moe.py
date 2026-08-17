@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
+import numpy as np
+import jax
+from jax.sharding import NamedSharding, PartitionSpec
 from torchax.interop import jax_view, torch_view
 from vllm.forward_context import is_forward_context_available
 from vllm.model_executor.layers import fused_moe as vllm_fused_moe
@@ -32,6 +35,7 @@ from tpu_inference.layers.common.moe import MoEBackend, moe_apply
 from tpu_inference.layers.common.process_weights.moe_weights import \
     FusedMoEWeights
 from tpu_inference.layers.common.sharding import is_attn_dp
+from tpu_inference.layers.vllm import expert_offload
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
@@ -156,6 +160,33 @@ def vllm_moe_apply(layer: RoutedExperts,
             logger.warning_once(
                 "MOE_ROUTE_PADDING_TO_EXPERT0: failed to read num_valid_tokens "
                 "from attn metadata, skipping padding routing (%s)", e)
+
+    # Host-backed MoE expert offload: if this layer has a registered host
+    # bank, route on host (topk -> ensure resident -> [T,S] remap), place the
+    # gating replicated, and compute with the S-slot device bank.
+    bank = expert_offload.get_bank(layer.layer_name)
+    if bank is not None:
+        logits_np = np.asarray(jax.device_get(jax_view(router_logits)))
+        g_np = bank.route(logits_np, layer.top_k)
+        g = jax.device_put(g_np, NamedSharding(mesh, PartitionSpec()))
+        weights = FusedMoEWeights(
+            w13_weight=bank.slot_w13,
+            w13_weight_scale=None,
+            w13_bias=None,
+            w2_weight=bank.slot_w2,
+            w2_weight_scale=None,
+            w2_bias=None,
+        )
+        return torch_view(
+            moe_apply(
+                layer=layer,
+                x=jax_view(x),
+                gating_output=g,
+                weights=weights,
+                moe_backend=quant_method_instance.moe_backend,
+                mesh=quant_method_instance.mesh,
+                extra_backend_kwargs=extra_kwargs,
+            ))
 
     return torch_view(
         moe_apply(

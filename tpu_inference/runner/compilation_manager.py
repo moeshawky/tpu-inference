@@ -95,6 +95,13 @@ class CompilationManager:
                 max_workers=num_workers, thread_name_prefix="aot_compilation")
         self._compile_futures: list[Future] = []
         self._warmup_tasks: list = []
+        # Pre-carve dummy block tables for precompilation, keyed by
+        # (kv_cache_gid, sharding-variant). Allocated in
+        # `prepare_dummy_block_tables` BEFORE the KV cache carve so the
+        # precompile phase never materializes the (up to 8 MiB per group)
+        # block-table dummies after the carve has consumed the device
+        # memory tail (see `prepare_dummy_block_tables`).
+        self._dummy_block_tables: dict[tuple[int, str], jax.Array] = {}
 
     def _create_dummy_tensor(self,
                              shape: Tuple[int, ...],
@@ -116,6 +123,92 @@ class CompilationManager:
         if sharding:
             return device_array(self.runner.mesh, tensor, sharding=sharding)
         return device_array(self.runner.mesh, tensor)
+
+    # Sharding variants used by the precompile block-table dummies. Each
+    # site keeps its EXACT historical sharding so the compiled programs
+    # (jit cache keys include the input sharding) are unchanged:
+    #   - "batch"     : backbone precompile (P(BATCH), `_precompile_backbone_helper`)
+    #   - "attn_data" : continue_decode / eagle3 / mtp (P(ATTN_DATA))
+    #   - "repl"      : dflash with dp_size == 1 (P() replicated)
+    _DUMMY_BLOCK_TABLE_SHARDINGS = {
+        "batch":
+        lambda mesh: NamedSharding(mesh, PartitionSpec(ShardingAxisName.BATCH)),
+        "attn_data":
+        lambda mesh: NamedSharding(
+            mesh, PartitionSpec(ShardingAxisName.ATTN_DATA)),
+        "repl":
+        lambda mesh: NamedSharding(mesh, PartitionSpec()),
+    }
+
+    def prepare_dummy_block_tables(self, kv_cache_config: Any) -> None:
+        """Allocate the precompile dummy block tables BEFORE the KV carve.
+
+        The precompile phase feeds REAL device arrays (not just abstract
+        shapes) into ``fn.lower()`` AND executes them in the warmup pass
+        (see ``_run_compilation``/``_flush_compilations``), so the dummies
+        must exist on device. Creating them after the KV cache carve (83+
+        GiB) leaves only a few MiB of tail; the 8 MiB block-table dummy
+        (128 reqs x 16384 blocks x 4 B for a compact-Mamba group) then
+        fails with RESOURCE_EXHAUSTED once prefix caching tightens the
+        tail (5.3 MiB free vs 8.00 MiB requested).
+
+        This method is called from ``KVCacheManager.initialize_kv_cache``
+        immediately after the input batch is (re-)initialized with the
+        per-group physical block sizes and before any KV cache memory is
+        allocated, so the dummy arrays live in the plentiful pre-carve
+        budget and are reused by every precompile combo (lower + warmup).
+        """
+        if envs.SKIP_JAX_PRECOMPILE or self.runner.model_config.enforce_eager:
+            return
+        if not kv_cache_config.kv_cache_groups:
+            return
+        self._dummy_block_tables.clear()
+        mesh = self.runner.mesh
+        # The draft-model KV group (spec decode) is the last group; this
+        # loop covers it like any other group.
+        for gid in range(len(kv_cache_config.kv_cache_groups)):
+            block_table_obj = self.runner.input_batch.block_table[gid]
+            shape = (self.runner.max_num_reqs *
+                     block_table_obj.max_num_blocks_per_req, )
+            zeros = np.zeros(shape, dtype=np.int32)
+            for variant, sharding_fn in self._DUMMY_BLOCK_TABLE_SHARDINGS.items():
+                if variant == "repl" and not (
+                        self.runner.speculative_config
+                        and self.runner.speculative_config.method == "dflash"
+                        and self.runner.dp_size == 1):
+                    continue
+                self._dummy_block_tables[(gid,
+                                          variant)] = device_array(
+                                              mesh,
+                                              zeros,
+                                              sharding=sharding_fn(mesh))
+        logger.info(
+            "Pre-carved %d dummy block-table variant(s) for %d KV group(s) "
+            "before the KV cache allocation.",
+            len(self._dummy_block_tables),
+            len(kv_cache_config.kv_cache_groups))
+
+    def _get_dummy_block_table(self, kv_cache_gid: int,
+                               variant: str) -> jax.Array:
+        """Return the pre-carve dummy block table for the given KV group.
+
+        Prefers the array allocated by ``prepare_dummy_block_tables``
+        (before the KV carve). Falls back to a fresh ``device_array``
+        dummy — the historical behavior — only for flows that precompile
+        without the pool (e.g. post-clear recompiles after a weight
+        update), so those flows see no behavior change.
+        """
+        table = self._dummy_block_tables.get((kv_cache_gid, variant))
+        if table is not None:
+            return table
+        block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
+        shape = (self.runner.max_num_reqs,
+                 block_table_obj.max_num_blocks_per_req)
+        block_tables = np.zeros(shape, dtype=np.int32).reshape(-1)
+        sharding = self._DUMMY_BLOCK_TABLE_SHARDINGS[variant](self.runner.mesh)
+        return device_array(self.runner.mesh,
+                            block_tables,
+                            sharding=sharding)
 
     def _should_skip_padding_combination(self, outer_val: int, inner_val: int,
                                          only_equal: bool) -> bool:
@@ -294,7 +387,13 @@ class CompilationManager:
     def _finalize_compilation(self) -> None:
         """Shut down the precompile pool and restore the thread stack default
         so the bumped stack size doesn't leak to threads spawned later by the
-        engine."""
+        engine. Also drops the pre-carve dummy block tables: precompilation
+        is complete at this point, so the ~16-24 MiB they occupy returns to
+        the device (steady state matches the pre-fix memory profile). Any
+        later recompile (e.g. after a weight update) rebuilds them on demand
+        via `_get_dummy_block_table`'s fallback.
+        """
+        self._dummy_block_tables.clear()
         if self._compile_executor is not None:
             self._compile_executor.shutdown(wait=True)
             self._compile_executor = None
@@ -444,15 +543,14 @@ class CompilationManager:
             mamba_state_indices = None
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
-            block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
-            shape = (self.runner.max_num_reqs,
-                     block_table_obj.max_num_blocks_per_req)
-            block_tables = np.zeros(shape, dtype=np.int32)
-            block_tables = block_tables.reshape(-1)
-            block_tables = device_array(self.runner.mesh,
-                                        block_tables,
-                                        sharding=metadata_attn_sharding)
-            return block_tables
+            # Pre-carve dummy (see `prepare_dummy_block_tables`): the
+            # 8 MiB (max_num_reqs x cdiv(max_model_len, 16) x 4 B)
+            # block-table dummy must NOT be allocated after the KV cache
+            # carve, or prefix caching (5.3 MiB tail) hits
+            # RESOURCE_EXHAUSTED. Shape/dtype/sharding are identical to
+            # the historical device_array dummy, so the compiled program
+            # is unchanged and the warmup execution reuses the same array.
+            return self._get_dummy_block_table(kv_cache_gid, "batch")
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
@@ -1459,13 +1557,14 @@ class CompilationManager:
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
-        block_tables = self.runner.input_batch.block_table[
-            draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+        # Pre-carve dummy (see `prepare_dummy_block_tables`): the draft
+        # group's full flat block table must not be re-materialized after
+        # the KV carve. Value-identical to the historical
+        # `input_batch.block_table[...].get_cpu_tensor()` (zeros at init).
+        block_tables = self._get_dummy_block_table(draft_kv_cache_group_id,
+                                                   "attn_data")
         dp_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
-        block_tables = device_array(self.runner.mesh,
-                                    block_tables,
-                                    sharding=dp_sharding)
 
         seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
                                              jnp.int32, dp_sharding)
@@ -1594,13 +1693,14 @@ class CompilationManager:
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
-        block_tables = self.runner.input_batch.block_table[
-            draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+        # Pre-carve dummy (see `prepare_dummy_block_tables`): the draft
+        # group's full flat block table must not be re-materialized after
+        # the KV carve. Value-identical to the historical
+        # `input_batch.block_table[...].get_cpu_tensor()` (zeros at init).
+        block_tables = self._get_dummy_block_table(draft_kv_cache_group_id,
+                                                   "attn_data")
         dp_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
-        block_tables = device_array(self.runner.mesh,
-                                    block_tables,
-                                    sharding=dp_sharding)
 
         seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
                                              jnp.int32, dp_sharding)
@@ -1724,16 +1824,18 @@ class CompilationManager:
 
         num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
         draft_kv_cache_group_id = num_kv_cache_groups - 1
-        block_tables = self.runner.input_batch.block_table[
-            draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
+        # Pre-carve dummy (see `prepare_dummy_block_tables`): the draft
+        # group's full flat block table must not be re-materialized after
+        # the KV carve. dflash replicates it when dp_size == 1 (P()),
+        # matching the historical `device_array` sharding exactly.
+        block_tables = self._get_dummy_block_table(
+            draft_kv_cache_group_id,
+            "repl" if dp_size == 1 else "attn_data")
         dp_spec = PartitionSpec() if dp_size == 1 else PartitionSpec(
             ShardingAxisName.ATTN_DATA)
         dp_spec_2d = PartitionSpec(ShardingAxisName.ATTN_DATA, None)
 
         dp_sharding = NamedSharding(self.runner.mesh, dp_spec)
-        block_tables = device_array(self.runner.mesh,
-                                    block_tables,
-                                    sharding=dp_sharding)
 
         seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
                                              jnp.int32, dp_sharding)
@@ -1968,16 +2070,11 @@ class CompilationManager:
                 mamba_state_indices = None
 
             def build_block_table(kv_cache_gid: int) -> jax.Array:
-                block_table_obj = self.runner.input_batch.block_table[
-                    kv_cache_gid]
-                shape = (self.runner.max_num_reqs,
-                         block_table_obj.max_num_blocks_per_req)
-                block_tables = np.zeros(shape, dtype=np.int32)
-                block_tables = block_tables.reshape(-1)
-                block_tables = device_array(self.runner.mesh,
-                                            block_tables,
-                                            sharding=dp_sharding)
-                return block_tables
+                # Pre-carve dummy (see `prepare_dummy_block_tables`):
+                # the full flat block table must not be re-materialized
+                # after the KV carve. Sharding is P(ATTN_DATA), identical
+                # to the historical `device_array` dummy.
+                return self._get_dummy_block_table(kv_cache_gid, "attn_data")
 
             if len(self.runner.kv_cache_config.kv_cache_groups) <= 1:
                 no_kv_cache = len(

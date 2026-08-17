@@ -717,6 +717,18 @@ class KVCacheManager:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.maybe_reinitialize_input_batch(kv_cache_config)
 
+        # Pre-carve the precompile dummy block tables BEFORE any KV cache
+        # memory is allocated below (create_kv_caches). The precompile
+        # phase runs after this method returns and materializes REAL
+        # device arrays for fn.lower() AND the warmup pass — an 8 MiB
+        # (max_num_reqs x max_num_blocks_per_req x 4 B) block-table dummy
+        # allocated post-carve fails with RESOURCE_EXHAUSTED once prefix
+        # caching leaves only ~5 MiB of device tail. Allocating here puts
+        # the dummies in the plentiful pre-carve budget; see
+        # `CompilationManager.prepare_dummy_block_tables`.
+        self.runner.compilation_manager.prepare_dummy_block_tables(
+            kv_cache_config)
+
         # There will be no KV cache for pooling models.
         if not kv_cache_config.kv_cache_groups:
             return

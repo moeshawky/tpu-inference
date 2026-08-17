@@ -10,6 +10,13 @@ logger = init_logger(__name__)
 
 
 # TODO(xiang): fix device allocation
+# NOTE: the PRE-COMPILE dummy block tables are no longer allocated here at
+# precompile time — `CompilationManager.prepare_dummy_block_tables` pre-carves
+# them BEFORE the KV cache carve (allocating after the carve exhausts the
+# device tail under prefix caching: RESOURCE_EXHAUSTED), and
+# `CompilationManager._get_dummy_block_table` serves them to every precompile
+# site. The `jnp.zeros` device array below is the InputBatch's OWN block table,
+# created during `maybe_reinitialize_input_batch` (also pre-carve) and kept.
 class BlockTable:
 
     def __init__(

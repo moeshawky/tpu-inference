@@ -163,7 +163,12 @@ def vllm_moe_apply(layer: RoutedExperts,
 
     # Host-backed MoE expert offload: if this layer has a registered host
     # bank, route on host (topk -> ensure resident -> [T,S] remap), place the
-    # gating replicated, and compute with the S-slot device bank.
+    # gating replicated, and compute with the S-slot device bank. Quantized
+    # (MXFP4/FP4) banks feed their slot block scales alongside the packed
+    # weights (the kernel needs fp32 scales to dequantize); unquantized banks
+    # carry slot_w13_scale / slot_w2_scale == None and the feed falls back to
+    # scale=None exactly as before the scale extension. Bias stays None (the
+    # offload gates refuse layers with bias).
     bank = expert_offload.get_bank(layer.layer_name)
     if bank is not None:
         logits_np = np.asarray(jax.device_get(jax_view(router_logits)))
@@ -171,10 +176,10 @@ def vllm_moe_apply(layer: RoutedExperts,
         g = jax.device_put(g_np, NamedSharding(mesh, PartitionSpec()))
         weights = FusedMoEWeights(
             w13_weight=bank.slot_w13,
-            w13_weight_scale=None,
+            w13_weight_scale=bank.slot_w13_scale,
             w13_bias=None,
             w2_weight=bank.slot_w2,
-            w2_weight_scale=None,
+            w2_weight_scale=bank.slot_w2_scale,
             w2_bias=None,
         )
         return torch_view(

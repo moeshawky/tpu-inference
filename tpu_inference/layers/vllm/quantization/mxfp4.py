@@ -17,7 +17,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import torch
-from jax.sharding import Mesh, PartitionSpec
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torch.nn.parameter import Parameter
 from torchax.interop import jax_view, torch_view
 from vllm.model_executor.layers.attention import Attention
@@ -47,6 +47,7 @@ from tpu_inference.layers.common.quant_methods import MXFP4
 from tpu_inference.layers.common.quantization import (
     MXFP4_REQUANTIZED_BLOCK_SIZE, dequantize_tensor_from_mxfp4_packed)
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.vllm import expert_offload
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
@@ -129,6 +130,31 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
     def is_monolithic(self) -> bool:
         return True
 
+    def _gmm_tp_w13_scale_sharding(self) -> NamedSharding:
+        """GMM_TP w13 block-scale layout: shard the last (MLP_TENSOR) axis.
+
+        4-D spec the kernel consumes (fused_moe_gmm.py tensor_parallel_gmm):
+        P(None, None, None, MLP_TENSOR) on [E, 8, 1, 4096] -- NOT the 2-D
+        weight sharding (P(None, None, MLP_TENSOR)); the scale contract is
+        dimensionally different from the weight contract.
+        """
+        return NamedSharding(
+            self.mesh,
+            P(None, None, None, ShardingAxisName.MLP_TENSOR))
+
+    def _gmm_tp_w2_scale_sharding(self) -> NamedSharding:
+        """GMM_TP w2 block-scale layout: shard the first block axis.
+
+        4-D spec the kernel consumes (fused_moe_gmm.py tensor_parallel_gmm):
+        P(None, MLP_TENSOR, None, None) on [E, 4, 1, 4096] -- NOT the 2-D
+        weight sharding (P(None, MLP_TENSOR, None)). NOTE: 4 blocks over the
+        MLP_TENSOR axis must divide evenly (mesh axis size 4 or 2); verified
+        at load time on TPU.
+        """
+        return NamedSharding(
+            self.mesh,
+            P(None, ShardingAxisName.MLP_TENSOR, None, None))
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, RoutedExperts)
         has_bias = layer.moe_config.has_bias
@@ -187,6 +213,38 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
             w2_weight_scale,
             w2_bias,
         )
+
+        if (expert_offload.layer_enabled(layer.layer_name)
+                and not self.moe.has_bias):
+            # Host-backed expert offload (MXFP4/FP4 path): register the full
+            # host bank -- packed float4_e2m1fn weights AND their fp32 block
+            # scales -- and keep only the initial S-slot bank on device, then
+            # skip full shard_moe_weights (mirror of the unquantized branch
+            # in unquantized.py, extended with the scale contract: the kernel
+            # cannot dequantize packed fp4 without the fp32 block scales).
+            # Hash-routed layers are refused inside register_bank (shared
+            # choke point covering this gate and the unquantized gate), so a
+            # None bank here falls through to the full shard path below.
+            bank = expert_offload.register_bank(
+                layer.layer_name, weights.w13_weight, weights.w2_weight,
+                self._gmm_tp_w13_sharding(), self._gmm_tp_w2_sharding(),
+                w13_scale_host=weights.w13_weight_scale,
+                w2_scale_host=weights.w2_weight_scale,
+                dev_w13_scale_sharding=self._gmm_tp_w13_scale_sharding(),
+                dev_w2_scale_sharding=self._gmm_tp_w2_scale_sharding(),
+                layer=layer)
+            if bank is not None:
+                layer.w13_weight = Parameter(torch_view(bank.slot_w13),
+                                             requires_grad=False)
+                layer.w2_weight = Parameter(torch_view(bank.slot_w2),
+                                            requires_grad=False)
+                layer.w13_weight_scale = Parameter(
+                    torch_view(bank.slot_w13_scale), requires_grad=False)
+                layer.w2_weight_scale = Parameter(
+                    torch_view(bank.slot_w2_scale), requires_grad=False)
+                jax.effects_barrier()
+                return
+
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))
 

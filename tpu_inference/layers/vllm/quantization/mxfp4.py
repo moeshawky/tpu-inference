@@ -47,6 +47,7 @@ from tpu_inference.layers.common.quant_methods import MXFP4
 from tpu_inference.layers.common.quantization import (
     MXFP4_REQUANTIZED_BLOCK_SIZE, dequantize_tensor_from_mxfp4_packed)
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.utils import cpu_mesh_context
 from tpu_inference.layers.vllm import expert_offload
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
@@ -116,6 +117,16 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
         self.moe_backend = select_moe_backend_from_fused_moe_config(self.moe)
 
         TpuFusedMoEMethodBase.__init__(self, self.moe_backend, ep_axis_name)
+
+    def _gmm_tp_w13_sharding(self) -> NamedSharding:
+        """GMM_TP w13 layout: shard the last (MLP_TENSOR) axis."""
+        return NamedSharding(self.mesh,
+                             P(None, None, ShardingAxisName.MLP_TENSOR))
+
+    def _gmm_tp_w2_sharding(self) -> NamedSharding:
+        """GMM_TP w2 layout: shard the middle (MLP_TENSOR) axis."""
+        return NamedSharding(self.mesh,
+                             P(None, ShardingAxisName.MLP_TENSOR, None))
 
     def get_fused_moe_quant_config(
             self, layer: torch.nn.Module) -> FusedMoEQuantConfig | None:
@@ -205,14 +216,32 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
                 w13_interleave=w13_interleave,
             )
 
-        weights = process_mxfp4_moe_weights(
-            w13_weight,
-            w13_weight_scale,
-            w13_bias,
-            w2_weight,
-            w2_weight_scale,
-            w2_bias,
-        )
+        # Keep the large dequantized expert tensors off device: the
+        # dequant/requant pipeline needs ~42 GB of HLO temporaries on a
+        # single chip when run on TPU (RESOURCE_EXHAUSTED on v5e 16 GB).
+        # Mirror the JAX-side MXFP4 path (layers/jax/quantization/mxfp4.py),
+        # which runs this pipeline under the CPU mesh. t2j commits to the
+        # TPU mesh, so re-place the inputs on the CPU device inside the
+        # context (jit rejects arguments on a different platform).
+        with cpu_mesh_context():
+            cpu_device = jax.devices("cpu")[0]
+            w13_weight = jax.device_put(w13_weight, cpu_device)
+            w13_weight_scale = jax.device_put(w13_weight_scale, cpu_device)
+            if w13_bias is not None:
+                w13_bias = jax.device_put(w13_bias, cpu_device)
+            w2_weight = jax.device_put(w2_weight, cpu_device)
+            w2_weight_scale = jax.device_put(w2_weight_scale, cpu_device)
+            if w2_bias is not None:
+                w2_bias = jax.device_put(w2_bias, cpu_device)
+
+            weights = process_mxfp4_moe_weights(
+                w13_weight,
+                w13_weight_scale,
+                w13_bias,
+                w2_weight,
+                w2_weight_scale,
+                w2_bias,
+            )
 
         if (expert_offload.layer_enabled(layer.layer_name)
                 and not self.moe.has_bias):
@@ -244,6 +273,14 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
                     torch_view(bank.slot_w2_scale), requires_grad=False)
                 jax.effects_barrier()
                 return
+
+        # The pipeline above ran on the CPU mesh; commit the processed
+        # weights back to the TPU mesh (replicated) so shard_moe_weights'
+        # reshard accepts them -- jax.device_put rejects inputs committed
+        # to a different platform or a partial device subset.
+        weights = jax.tree_util.tree_map(
+            lambda a: jax.device_put(a, NamedSharding(self.mesh, P())),
+            weights)
 
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))

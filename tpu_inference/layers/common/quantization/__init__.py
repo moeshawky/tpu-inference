@@ -19,7 +19,13 @@ import jax
 import jax.numpy as jnp
 
 MXFP4_BLOCK_SIZE = 32
-MXFP4_REQUANTIZED_BLOCK_SIZE = 512
+# Requantized block size must divide the MoE contraction dims so the
+# GMM_TP block-scale sharding stays divisible across the tensor-parallel
+# axis. DeepSeek-V4-Flash w2 (down-proj) contraction dim is 2048: with 512
+# that is only 4 blocks, which cannot shard across MLP_TENSOR=8 (TP=8)
+# -> IndivisibleError in shard_moe_weights. 256 gives 8 w2 blocks and 16
+# w13 blocks, both divisible by 8.
+MXFP4_REQUANTIZED_BLOCK_SIZE = 256
 
 
 def quantize_tensor_to_mxfp4_packed(

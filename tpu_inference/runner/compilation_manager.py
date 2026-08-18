@@ -267,6 +267,11 @@ class CompilationManager:
                 # AOT lower not supported here (e.g. a jit whose body contains a
                 # nested jit with compiler_options). Fall back to warmup-only — the
                 # warmup pass will trigger inline compile.
+                if isinstance(e, AssertionError):
+                    # Bare asserts inside the traced forward (e.g. a shape
+                    # guard) are real bugs, not tracing limitations. Log the
+                    # full traceback so the abort site is visible.
+                    logger.error("AOT lower failed with %s", e, exc_info=True)
                 logger.info(
                     "AOT lower skipped for %s (%r); will compile in warmup.",
                     name, e)

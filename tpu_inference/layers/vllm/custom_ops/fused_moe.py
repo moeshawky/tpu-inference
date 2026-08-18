@@ -168,3 +168,27 @@ class VllmMoERunner(MoERunner):
         if not is_dp and not is_sequence_parallel and not output_is_reduced:
             states = _all_reduce_over_tp(states, mesh)
         return states[..., :trunc_size]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # The shared-expert slot is written by the first
+        # `_maybe_apply_shared_experts` call (NO_OVERLAP) inside
+        # `_apply_quant_method` and cleared by the trailing `.output` read.
+        # A forward that aborts in between (e.g. an assertion raised while
+        # tracing a precompile bucket) leaves the slot set, poisoning every
+        # later forward with a spurious "output slot not None" assert.
+        # On TPU the write/read pair is synchronous within one forward, so
+        # clearing at entry is safe and makes aborted traces harmless.
+        if self._shared_experts is not None:
+            self._shared_experts._output[0] = None
+        return super().forward(
+            hidden_states,
+            router_logits,
+            input_ids=input_ids,
+            shared_experts_input=shared_experts_input,
+        )

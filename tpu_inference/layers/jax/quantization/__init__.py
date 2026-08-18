@@ -23,7 +23,8 @@ from tpu_inference.layers.jax import JaxModule
 
 def get_tpu_quantization_config(vllm_config: VllmConfig):
     from tpu_inference.layers.common.quant_methods import (COMPRESSED_TENSORS,
-                                                           FP8, MXFP4)
+                                                           DSV4_FP8, FP8,
+                                                           MXFP4)
     from tpu_inference.layers.jax.quantization.compressed_tensors import \
         CompressedTensorsConfig
     from tpu_inference.layers.jax.quantization.fp8 import Fp8Config
@@ -32,6 +33,23 @@ def get_tpu_quantization_config(vllm_config: VllmConfig):
         UnquantizedConfig
 
     model_config = copy.deepcopy(vllm_config.model_config)
+
+    if model_config.quantization == DSV4_FP8:
+        # DeepSeek-V4 hybrid path: the model is composed of vLLM-native
+        # layers (RoutedExperts, LinearBase) whose quant methods dispatch
+        # through the vLLM-side VllmDeepseekV4Fp8Config (Fp8Linear,
+        # Mxfp4MoE / Fp8MoE — all TPU methods in this fork). There is no
+        # JAX-side config for this method, so keep (or reconstruct) the
+        # vLLM-side config instead of replacing it.
+        from tpu_inference.layers.vllm.quantization.deepseek_v4_fp8 import \
+            VllmDeepseekV4Fp8Config
+        current = vllm_config.quant_config
+        if isinstance(current, VllmDeepseekV4Fp8Config):
+            return current
+        hg_quant_config = getattr(model_config.hf_config,
+                                  "quantization_config", {})
+        return VllmDeepseekV4Fp8Config.from_config(hg_quant_config)
+
     method_to_config: dict[str | None, type] = {
         None: UnquantizedConfig,
         FP8: Fp8Config,

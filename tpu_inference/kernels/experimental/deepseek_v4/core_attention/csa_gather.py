@@ -290,6 +290,27 @@ def csa_gather(
     nope_cache = nope_cache.reshape(-1, nope_cache.shape[3])
     rope_cache = rope_cache.reshape(-1, rope_cache.shape[3])
     sc_info = pltpu.get_tpu_info().sparse_core
+    if sc_info is None:
+        # No SparseCore on this chip (e.g. v5e): fall back to a plain
+        # gather with the exact output layout of the SparseCore kernel.
+        # nope: token t lives at flat rows [4t, 4t+4) of (_, 128) uint8;
+        # each (4, 128) block is byte-transposed to (512,) uint8, where
+        # output word w of sub-row m packs byte-lane m of input rows 0..3.
+        nope4 = nope_cache.reshape(-1, 4, 128)[indices]          # (N,4,128) u8
+        w = nope4.view(jnp.int32).reshape(-1, 4, 32)             # (N,4,32) i32
+        lanes = [
+            sum(((w[:, r, :] >> (8 * m)) & 0xFF) << (8 * r)
+                for r in range(4))
+            for m in range(4)
+        ]                                                        # 4 x (N,32)
+        nope_out = jnp.stack(lanes, axis=1).reshape(-1, 128).view(jnp.uint8)
+        # rope: token t is flat row t; bytes [0:64] are bf16 high bytes,
+        # bytes [64:128] the low bytes of the 64 bf16 values.
+        row = rope_cache[indices]                                # (N,128) u8
+        u16 = ((row[:, 0:64].astype(jnp.uint16) << 8)
+               | row[:, 64:128].astype(jnp.uint16))
+        rope_out = lax.bitcast_convert_type(u16, jnp.bfloat16)   # (N,64) bf16
+        return nope_out, rope_out
     assert sc_info is not None, "SparseCore info is missing."
     out_size = indices.size
     nope_out_cols = 512

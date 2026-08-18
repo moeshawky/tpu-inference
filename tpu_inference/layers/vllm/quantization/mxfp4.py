@@ -14,6 +14,8 @@
 
 from typing import Optional
 
+import gc
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -145,7 +147,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
         """GMM_TP w13 block-scale layout: shard the last (MLP_TENSOR) axis.
 
         4-D spec the kernel consumes (fused_moe_gmm.py tensor_parallel_gmm):
-        P(None, None, None, MLP_TENSOR) on [E, 8, 1, 4096] -- NOT the 2-D
+        P(None, None, None, MLP_TENSOR) on [E, 16, 1, 4096] -- NOT the 2-D
         weight sharding (P(None, None, MLP_TENSOR)); the scale contract is
         dimensionally different from the weight contract.
         """
@@ -157,8 +159,8 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
         """GMM_TP w2 block-scale layout: shard the first block axis.
 
         4-D spec the kernel consumes (fused_moe_gmm.py tensor_parallel_gmm):
-        P(None, MLP_TENSOR, None, None) on [E, 4, 1, 4096] -- NOT the 2-D
-        weight sharding (P(None, MLP_TENSOR, None)). NOTE: 4 blocks over the
+        P(None, MLP_TENSOR, None, None) on [E, 8, 1, 4096] -- NOT the 2-D
+        weight sharding (P(None, MLP_TENSOR, None)). NOTE: 8 blocks over the
         MLP_TENSOR axis must divide evenly (mesh axis size 4 or 2); verified
         at load time on TPU.
         """
@@ -169,6 +171,18 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, RoutedExperts)
         has_bias = layer.moe_config.has_bias
+        offload_layer = (not has_bias
+                         and expert_offload.layer_enabled(layer.layer_name))
+        if offload_layer:
+            source_bytes = sum(
+                expert_offload.tensor_nbytes(tensor) for tensor in (
+                    layer.w13_weight,
+                    layer.w13_weight_scale,
+                    layer.w2_weight,
+                    layer.w2_weight_scale,
+                ))
+            expert_offload.check_host_memory_budget(layer.layer_name,
+                                                    source_bytes)
 
         w13_weight = t2j(layer.w13_weight, use_dlpack=False)
         w13_weight_scale = t2j(layer.w13_weight_scale, use_dlpack=False)
@@ -243,8 +257,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
                 w2_bias,
             )
 
-        if (expert_offload.layer_enabled(layer.layer_name)
-                and not self.moe.has_bias):
+        if offload_layer:
             # Host-backed expert offload (MXFP4/FP4 path): register the full
             # host bank -- packed float4_e2m1fn weights AND their fp32 block
             # scales -- and keep only the initial S-slot bank on device, then
@@ -272,6 +285,9 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
                 layer.w2_weight_scale = Parameter(
                     torch_view(bank.slot_w2_scale), requires_grad=False)
                 jax.effects_barrier()
+                del w13_weight, w13_weight_scale, w13_bias
+                del w2_weight, w2_weight_scale, w2_bias, weights
+                gc.collect()
                 return
 
         # The pipeline above ran on the CPU mesh; commit the processed
@@ -296,6 +312,15 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
         if has_bias:
             layer.w13_bias = Parameter(weights.w13_bias, requires_grad=False)
             layer.w2_bias = Parameter(weights.w2_bias, requires_grad=False)
+
+        # Do not let async CPU/XLA intermediates accumulate across the many
+        # DeepSeek MoE layers. The guard above prevents the next layer from
+        # starting when its working set would cross the cgroup budget; this
+        # barrier and explicit release keep the accepted layers below it.
+        jax.effects_barrier()
+        del w13_weight, w13_weight_scale, w13_bias
+        del w2_weight, w2_weight_scale, w2_bias, weights
+        gc.collect()
 
     def apply_monolithic(
         self,

@@ -12,7 +12,8 @@ scripts/expert_offload_stage4.py).
 
 Quantized (MXFP4/FP4) banks additionally mirror the fp32 block scales
 (w13_weight_scale / w2_weight_scale, 4-D GMM_TP processed layout) next to
-the packed float4_e2m1fn weights; the slot cache carries both so an evicted
+packed float4_e2m1fn weights; for the DeepSeek-V4-0731 path these are
+[N, 16, 1, 4096] / [N, 8, 1, 4096]. The slot cache carries both so an
 expert's scales are always swapped together with its weights. The kernel
 consumes the 4-D scale shardings P(None,None,None,MLP_TENSOR) and
 P(None,MLP_TENSOR,None,None) (fused_moe_gmm.py tensor_parallel_gmm), which
@@ -40,6 +41,8 @@ Wiring (stage4_patch_spec.md Section 3 + mxfp4 offload):
     slot scales.
 """
 
+from pathlib import Path
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -49,6 +52,168 @@ from tpu_inference import envs
 from tpu_inference.logger import init_logger
 
 logger = init_logger(__name__)
+
+_BYTES_PER_GIB = 1 << 30
+_CGROUP_MEMORY_CURRENT = (
+    "/sys/fs/cgroup/memory.current",
+    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+)
+_CGROUP_MEMORY_LIMIT = (
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+)
+
+
+def _read_memory_counter(paths: tuple[str, ...]) -> int | None:
+    """Read the first available Linux memory counter, tolerating ``max``."""
+    for path in paths:
+        try:
+            value = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if not value or value == "max":
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
+    return None
+
+
+def _read_proc_mem_available() -> int | None:
+    """Read host MemAvailable without importing a third-party monitor."""
+    try:
+        lines = Path("/proc/meminfo").read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith("MemAvailable:"):
+            try:
+                # /proc/meminfo reports this field in KiB.
+                return int(line.split()[1]) * 1024
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def _read_memory_stat() -> dict[str, int]:
+    """Read cgroup v2 memory.stat counters when available."""
+    try:
+        lines = Path("/sys/fs/cgroup/memory.stat").read_text().splitlines()
+    except OSError:
+        return {}
+    counters: dict[str, int] = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) == 2:
+            try:
+                counters[fields[0]] = int(fields[1])
+            except ValueError:
+                continue
+    return counters
+
+
+def _host_memory_snapshot() -> dict[str, int | None]:
+    """Return committed and reclaimable cgroup memory separately.
+
+    Kaggle exposes more physical RAM through /proc than the notebook cgroup
+    permits. The cgroup limit remains authoritative, but ``memory.current``
+    includes reclaimable NFS page cache. Treating every cached checkpoint page
+    as committed process memory rejects valid loads; report that cache
+    separately and base admission on committed memory plus an explicit reserve.
+    """
+    current = _read_memory_counter(_CGROUP_MEMORY_CURRENT)
+    limit = _read_memory_counter(_CGROUP_MEMORY_LIMIT)
+    stats = _read_memory_stat()
+    file_bytes = stats.get("file", 0)
+    shmem_bytes = stats.get("shmem", 0)
+    unevictable_bytes = stats.get("unevictable", 0)
+    reclaimable_file = max(file_bytes - shmem_bytes - unevictable_bytes, 0)
+    committed = (max(current - reclaimable_file, 0)
+                 if current is not None else None)
+    cgroup_available = (max(limit - committed, 0)
+                        if committed is not None and limit is not None else None)
+    proc_available = _read_proc_mem_available()
+    candidates = [value for value in (cgroup_available, proc_available)
+                  if value is not None]
+    available = min(candidates) if candidates else None
+    return {
+        "cgroup_current": current,
+        "cgroup_limit": limit,
+        "cgroup_available": cgroup_available,
+        "cgroup_committed": committed,
+        "cgroup_reclaimable_file": reclaimable_file,
+        "proc_available": proc_available,
+        "available": available,
+    }
+
+
+def _memory_guard_message(available: int | None, working_set: int,
+                          reserve: int) -> str | None:
+    """Return an admission error when the next layer cannot fit safely."""
+    if available is None or available >= working_set + reserve:
+        return None
+    return (f"host memory guard refused next MoE layer: available="
+            f"{available / _BYTES_PER_GIB:.2f} GiB, estimated CPU working "
+            f"set={working_set / _BYTES_PER_GIB:.2f} GiB, safety reserve="
+            f"{reserve / _BYTES_PER_GIB:.2f} GiB")
+
+
+def tensor_nbytes(tensor) -> int:
+    """Return tensor bytes without materializing or copying the tensor."""
+    nbytes = getattr(tensor, "nbytes", None)
+    if isinstance(nbytes, int):
+        return nbytes
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def check_host_memory_budget(layer_name: str, source_bytes: int) -> None:
+    """Reject a layer before its CPU MXFP4 peak can kill the notebook.
+
+    The CPU requantization path has a large transient working set and bank
+    registration may briefly hold both the processed JAX arrays and NumPy
+    views. Estimate at least the configured working set, scaling it with the
+    incoming tensor size for larger models, and preserve an explicit reserve
+    for the notebook kernel and runtime. This is an admission guard, not a
+    claim that the model will fit after admission.
+    """
+    if not envs.MOE_EXPERT_OFFLOAD_HOST_MEMORY_GUARD:
+        return
+    if source_bytes < 0:
+        raise ValueError(f"negative source_bytes for {layer_name}: {source_bytes}")
+
+    configured_working_set = max(
+        int(envs.MOE_EXPERT_OFFLOAD_CPU_WORKING_SET_GIB), 0) * _BYTES_PER_GIB
+    working_set = max(configured_working_set, source_bytes * 8)
+    reserve = max(int(envs.MOE_EXPERT_OFFLOAD_HOST_MEMORY_RESERVE_GIB),
+                  0) * _BYTES_PER_GIB
+    snapshot = _host_memory_snapshot()
+    available = snapshot["available"]
+    logger.info(
+        "[expert-offload] host memory admission layer=%s available=%.2f GiB "
+        "cgroup_current=%.2f GiB committed=%.2f GiB reclaimable_file=%.2f "
+        "GiB cgroup_limit=%.2f GiB source=%.2f GiB working_set=%.2f GiB "
+        "reserve=%.2f GiB",
+        layer_name,
+        available / _BYTES_PER_GIB if available is not None else -1.0,
+        snapshot["cgroup_current"] / _BYTES_PER_GIB
+        if snapshot["cgroup_current"] is not None else -1.0,
+        snapshot["cgroup_committed"] / _BYTES_PER_GIB
+        if snapshot["cgroup_committed"] is not None else -1.0,
+        snapshot["cgroup_reclaimable_file"] / _BYTES_PER_GIB,
+        snapshot["cgroup_limit"] / _BYTES_PER_GIB
+        if snapshot["cgroup_limit"] is not None else -1.0,
+        source_bytes / _BYTES_PER_GIB,
+        working_set / _BYTES_PER_GIB,
+        reserve / _BYTES_PER_GIB,
+    )
+    message = _memory_guard_message(available, working_set, reserve)
+    if message is not None:
+        raise RuntimeError(
+            f"[expert-offload] {message}; layer={layer_name}. Reduce "
+            "MOE_EXPERT_OFFLOAD_LAYERS, lower MOE_EXPERT_OFFLOAD_SLOTS, "
+            "or increase the host-memory budget before retrying.")
+
 
 # Registry of per-layer host banks, keyed by the vLLM FusedMoE prefix
 # "model.layers.{i}.ffn.experts" (== layer.layer_name at serve time). The
@@ -122,14 +287,23 @@ class _LayerBank:
                  w2_scale_host: np.ndarray | None = None,
                  dev_w13_scale_sharding=None, dev_w2_scale_sharding=None):
         self.layer_name = layer_name
-        self.w13_host = w13_host            # host numpy mirror [N, 2048, 2048]
-        self.w2_host = w2_host              # host numpy mirror [N, 2048, 512]
+        self.w13_host = w13_host            # processed host mirror [N, ...]
+        self.w2_host = w2_host              # processed host mirror [N, ...]
+        # JAX float4 uses one byte per value in host NumPy storage, although
+        # only the low nibble is meaningful. Pack two codes per byte to keep
+        # all 40 processed banks resident without an overlay/NFS write path.
+        self._w13_packed = (w13_host.dtype == np.uint8
+                            and envs.MOE_EXPERT_OFFLOAD_PACKED_HOST)
+        self._w2_packed = (w2_host.dtype == np.uint8
+                           and envs.MOE_EXPERT_OFFLOAD_PACKED_HOST)
+        self._float4_dtype = (np.dtype("float4_e2m1fn")
+                              if self._w13_packed or self._w2_packed else None)
         self.dev_w13_sharding = dev_w13_sharding   # GMM_TP: P(None, None, MLP_TENSOR)
         self.dev_w2_sharding = dev_w2_sharding     # GMM_TP: P(None, MLP_TENSOR, None)
         # MXFP4/FP4 block scales (fp32, GMM_TP processed 4-D layout) mirrored
         # on host; None for unquantized banks.
-        self.w13_scale_host = w13_scale_host  # host mirror [N, 8, 1, 4096] or None
-        self.w2_scale_host = w2_scale_host    # host mirror [N, 4, 1, 4096] or None
+        self.w13_scale_host = w13_scale_host  # host mirror [N, 16, 1, 4096] or None
+        self.w2_scale_host = w2_scale_host    # host mirror [N, 8, 1, 4096] or None
         # 4-D kernel scale shardings: P(None,None,None,MLP_TENSOR) /
         # P(None,MLP_TENSOR,None,None) -- NOT the 2-D weight shardings above.
         self.dev_w13_scale_sharding = dev_w13_scale_sharding
@@ -157,6 +331,18 @@ class _LayerBank:
             host_bytes / 1e9,
             "yes" if self.w13_scale_host is not None else "no")
 
+    def _unpack_weight_rows(self, packed: np.ndarray,
+                            packed_enabled: bool) -> np.ndarray:
+        """Expand packed FP4 codes into the dtype consumed by the TPU kernel."""
+        if not packed_enabled:
+            return np.array(packed).copy()
+        full_shape = list(packed.shape)
+        full_shape[-1] *= 2
+        raw = np.empty(full_shape, dtype=np.uint8)
+        raw[..., 0::2] = packed & 0x0F
+        raw[..., 1::2] = (packed >> 4) & 0x0F
+        return raw.view(self._float4_dtype)
+
     def _allocate_initial_slots(self) -> None:
         """Initial residency: experts 0..S-1 fill the S device slots.
 
@@ -167,8 +353,10 @@ class _LayerBank:
         kernel shardings alongside the packed weights.
         """
         S = self.slots
-        self.slot13_host = np.array(self.w13_host[:S]).copy()
-        self.slot2_host = np.array(self.w2_host[:S]).copy()
+        self.slot13_host = self._unpack_weight_rows(
+            self.w13_host[:S], self._w13_packed)
+        self.slot2_host = self._unpack_weight_rows(
+            self.w2_host[:S], self._w2_packed)
         self.slot_w13 = jax.device_put(self.slot13_host,
                                        self.dev_w13_sharding)
         self.slot_w2 = jax.device_put(self.slot2_host, self.dev_w2_sharding)
@@ -243,8 +431,10 @@ class _LayerBank:
         holds expert A's weights with expert B's scales (eviction swaps the
         pair atomically).
         """
-        self.slot13_host[slot] = self.w13_host[expert_id]
-        self.slot2_host[slot] = self.w2_host[expert_id]
+        self.slot13_host[slot] = self._unpack_weight_rows(
+            self.w13_host[expert_id:expert_id + 1], self._w13_packed)[0]
+        self.slot2_host[slot] = self._unpack_weight_rows(
+            self.w2_host[expert_id:expert_id + 1], self._w2_packed)[0]
         if self.w13_scale_host is not None:
             self.slot13_scale_host[slot] = self.w13_scale_host[expert_id]
             self.slot2_scale_host[slot] = self.w2_scale_host[expert_id]
@@ -302,6 +492,39 @@ class _LayerBank:
         return gating
 
 
+def _host_array(layer_name: str, field: str, value: jax.Array) -> np.ndarray:
+    """Materialize a host bank, optionally packed or disk-backed.
+
+    Packed FP4 banks keep the complete processed expert weights in anonymous
+    memory at half their NumPy footprint. Disk-backed mode remains available
+    for hosts without enough RAM, but is intentionally not used on Kaggle's
+    slow overlay filesystem.
+    """
+    array = np.asarray(jax.device_get(value))
+    if (envs.MOE_EXPERT_OFFLOAD_PACKED_HOST
+            and getattr(array.dtype, "name", "") == "float4_e2m1fn"):
+        raw = array.view(np.uint8)
+        if raw.shape[-1] % 2:
+            raise ValueError(
+                f"cannot nibble-pack odd FP4 axis for {layer_name}.{field}: "
+                f"{raw.shape}")
+        array = ((raw[..., 0::2] & 0x0F)
+                 | ((raw[..., 1::2] & 0x0F) << 4)).copy()
+    if not envs.MOE_EXPERT_OFFLOAD_DISK_BACKED:
+        return array
+
+    storage_dir = Path(envs.MOE_EXPERT_OFFLOAD_STORAGE_DIR)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    safe_layer = layer_name.replace("/", "_").replace(".", "_")
+    path = storage_dir / f"{safe_layer}.{field}.npy"
+    mmap = np.lib.format.open_memmap(
+        path, mode="w+", dtype=array.dtype, shape=array.shape)
+    mmap[...] = array
+    mmap.flush()
+    del array
+    return mmap
+
+
 def register_bank(layer_name: str, w13_host: jax.Array, w2_host: jax.Array,
                   dev_w13_sharding, dev_w2_sharding,
                   w13_scale_host: jax.Array | None = None,
@@ -344,14 +567,18 @@ def register_bank(layer_name: str, w13_host: jax.Array, w2_host: jax.Array,
             "refusing to bank -- layer stays resident on the full-bank path.",
             layer_name)
         return None
-    bank = _LayerBank(layer_name,
-                      np.asarray(jax.device_get(w13_host)),
-                      np.asarray(jax.device_get(w2_host)),
-                      dev_w13_sharding, dev_w2_sharding,
-                      None if w13_scale_host is None else np.asarray(
-                          jax.device_get(w13_scale_host)),
-                      None if w2_scale_host is None else np.asarray(
-                          jax.device_get(w2_scale_host)),
-                      dev_w13_scale_sharding, dev_w2_scale_sharding)
+    bank = _LayerBank(
+        layer_name,
+        _host_array(layer_name, "w13", w13_host),
+        _host_array(layer_name, "w2", w2_host),
+        dev_w13_sharding,
+        dev_w2_sharding,
+        None if w13_scale_host is None else _host_array(
+            layer_name, "w13_scale", w13_scale_host),
+        None if w2_scale_host is None else _host_array(
+            layer_name, "w2_scale", w2_scale_host),
+        dev_w13_scale_sharding,
+        dev_w2_scale_sharding,
+    )
     _BANKS[layer_name] = bank
     return bank

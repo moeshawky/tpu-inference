@@ -86,6 +86,12 @@ if TYPE_CHECKING:
     MOE_EXPERT_OFFLOAD: bool = False
     MOE_EXPERT_OFFLOAD_SLOTS: int = 16
     MOE_EXPERT_OFFLOAD_LAYERS: str = ""
+    MOE_EXPERT_OFFLOAD_HOST_MEMORY_GUARD: bool = True
+    MOE_EXPERT_OFFLOAD_HOST_MEMORY_RESERVE_GIB: int = 12
+    MOE_EXPERT_OFFLOAD_CPU_WORKING_SET_GIB: int = 16
+    MOE_EXPERT_OFFLOAD_DISK_BACKED: bool = False
+    MOE_EXPERT_OFFLOAD_PACKED_HOST: bool = False
+    MOE_EXPERT_OFFLOAD_STORAGE_DIR: str = "/kaggle/temp/moe_expert_banks"
 
 
 def env_with_choices(
@@ -497,6 +503,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("MOE_EXPERT_OFFLOAD_SLOTS", "16")),
     "MOE_EXPERT_OFFLOAD_LAYERS":
     lambda: os.getenv("MOE_EXPERT_OFFLOAD_LAYERS", ""),
+    # Refuse a new host-backed bank before its CPU processing peak can exhaust
+    # a Kaggle notebook cgroup and take down the notebook kernel.
+    "MOE_EXPERT_OFFLOAD_HOST_MEMORY_GUARD":
+    env_bool("MOE_EXPERT_OFFLOAD_HOST_MEMORY_GUARD", default=True),
+    "MOE_EXPERT_OFFLOAD_HOST_MEMORY_RESERVE_GIB":
+    lambda: int(os.getenv("MOE_EXPERT_OFFLOAD_HOST_MEMORY_RESERVE_GIB", "12")),
+    "MOE_EXPERT_OFFLOAD_CPU_WORKING_SET_GIB":
+    lambda: int(os.getenv("MOE_EXPERT_OFFLOAD_CPU_WORKING_SET_GIB", "16")),
+    # Store full host expert banks as disk-backed NumPy memmaps. This keeps
+    # only the routed slot cache resident in RAM on memory-constrained hosts.
+    "MOE_EXPERT_OFFLOAD_DISK_BACKED":
+    env_bool("MOE_EXPERT_OFFLOAD_DISK_BACKED", default=False),
+    "MOE_EXPERT_OFFLOAD_PACKED_HOST":
+    env_bool("MOE_EXPERT_OFFLOAD_PACKED_HOST", default=False),
+    "MOE_EXPERT_OFFLOAD_STORAGE_DIR":
+    lambda: os.getenv("MOE_EXPERT_OFFLOAD_STORAGE_DIR",
+                      "/kaggle/temp/moe_expert_banks"),
     # Controls whether FP8 linear and MoE layers perform incremental weight
     # loading, sharding, and immediate host RAM cleanup. When enabled, weights
     # are sharded and transferred to TPU device memory layer-by-layer (or per

@@ -36,10 +36,10 @@ from tpu_inference.layers.common.process_weights.moe_weights import \
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.vllm import expert_offload
 
-# DeepSeek-V4-0731 scale dims (block 512, hidden 4096, moe_intermediate 2048)
+# DeepSeek-V4-0731 scale dims (block 256, hidden 4096, moe_intermediate 2048)
 # as produced by process_moe_weights for the MXFP4 requant path.
-W13_SCALE_BLOCKS = 8  # hidden_size // block_size
-W2_SCALE_BLOCKS = 4   # moe_intermediate_size // block_size
+W13_SCALE_BLOCKS = 16  # hidden_size // block_size
+W2_SCALE_BLOCKS = 8    # moe_intermediate_size // block_size
 HIDDEN = 4096
 
 N_EXPERTS = 16
@@ -57,6 +57,9 @@ def _offload_clean_env(monkeypatch):
     monkeypatch.delenv("MOE_EXPERT_OFFLOAD", raising=False)
     monkeypatch.delenv("MOE_EXPERT_OFFLOAD_SLOTS", raising=False)
     monkeypatch.delenv("MOE_EXPERT_OFFLOAD_LAYERS", raising=False)
+    monkeypatch.delenv("MOE_EXPERT_OFFLOAD_HOST_MEMORY_GUARD", raising=False)
+    monkeypatch.delenv("MOE_EXPERT_OFFLOAD_HOST_MEMORY_RESERVE_GIB", raising=False)
+    monkeypatch.delenv("MOE_EXPERT_OFFLOAD_CPU_WORKING_SET_GIB", raising=False)
     expert_offload.clear_all()
     yield
     expert_offload.clear_all()
@@ -300,6 +303,37 @@ def test_quantized_feed_carries_scales(cpu_mesh, monkeypatch):
         S_SLOTS, W13_SCALE_BLOCKS, 1, HIDDEN)
     assert weights.w2_weight_scale.shape == (
         S_SLOTS, W2_SCALE_BLOCKS, 1, HIDDEN)
+
+
+def test_memory_guard_rejects_before_cgroup_exhaustion(monkeypatch):
+    """The admission guard rejects a peak that would consume the reserve."""
+    gib = 1 << 30
+    assert expert_offload._memory_guard_message(100 * gib, 48 * gib,
+                                                24 * gib) is None
+    message = expert_offload._memory_guard_message(71 * gib, 48 * gib,
+                                                   24 * gib)
+    assert message is not None
+    assert "available=71.00 GiB" in message
+    assert "safety reserve=24.00 GiB" in message
+
+
+def test_memory_guard_uses_cgroup_snapshot(monkeypatch):
+    """A cgroup limit is honored even when host MemAvailable is larger."""
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_HOST_MEMORY_GUARD", "1")
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_HOST_MEMORY_RESERVE_GIB", "24")
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_CPU_WORKING_SET_GIB", "48")
+    monkeypatch.setattr(
+        expert_offload, "_host_memory_snapshot", lambda: {
+            "cgroup_current": 259 * (1 << 30),
+            "cgroup_limit": 330 * (1 << 30),
+            "cgroup_available": 71 * (1 << 30),
+            "proc_available": 381 * (1 << 30),
+            "available": 71 * (1 << 30),
+        })
+
+    with pytest.raises(RuntimeError, match="host memory guard refused"):
+        expert_offload.check_host_memory_budget("model.layers.21.ffn.experts",
+                                                source_bytes=1 << 30)
 
 
 def test_scale_args_must_be_a_pair(cpu_mesh, monkeypatch):

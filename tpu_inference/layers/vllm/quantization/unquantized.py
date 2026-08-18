@@ -426,16 +426,22 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
         if (expert_offload.layer_enabled(layer.layer_name)
                 and not self.moe.has_bias):
             # Host-backed expert offload: register the full host bank and keep
-            # only the initial S-slot bank on device. Skip full shard_moe_weights.
+            # only the initial S-slot bank on device. Skip full
+            # shard_moe_weights. Unquantized banks carry no scales
+            # (scale args default to None). register_bank returns None for
+            # hash-routed layers (shared guard) and when offload is disabled
+            # -- fall through to the full shard path in that case.
             bank = expert_offload.register_bank(
                 layer.layer_name, weights.w13_weight, weights.w2_weight,
-                self._gmm_tp_w13_sharding(), self._gmm_tp_w2_sharding())
-            layer.w13_weight = Parameter(torch_view(bank.slot_w13),
-                                         requires_grad=False)
-            layer.w2_weight = Parameter(torch_view(bank.slot_w2),
-                                        requires_grad=False)
-            jax.effects_barrier()
-            return
+                self._gmm_tp_w13_sharding(), self._gmm_tp_w2_sharding(),
+                layer=layer)
+            if bank is not None:
+                layer.w13_weight = Parameter(torch_view(bank.slot_w13),
+                                             requires_grad=False)
+                layer.w2_weight = Parameter(torch_view(bank.slot_w2),
+                                            requires_grad=False)
+                jax.effects_barrier()
+                return
 
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))

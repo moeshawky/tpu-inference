@@ -1644,21 +1644,30 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
-                (self.kv_caches, hidden_states, aux_hidden_states,
-                 expert_indices) = self.model_fn(
-                     self.state_leaves,
-                     self.kv_caches,
-                     input_ids,
-                     attn_metadata,
-                     inputs_embeds,
-                     input_positions,
-                     tuple(self.layer_name_to_kvcache_index.items()),
-                     lora_metadata,
-                     intermediate_tensors,
-                     self.is_first_rank,
-                     self.is_last_rank,
-                     shared_attention_metadata=shared_attn_metadata,
-                 )
+                # Eager mode (enforce_eager): run the step without jit so
+                # host-orchestrated MoE expert banks (host-side numpy routing +
+                # device_put slot refresh) work with concrete arrays. The jit
+                # trace cannot host-route (TracerArrayConversionError) and
+                # would freeze slot weights as trace-time constants.
+                eager = getattr(
+                    self.model_config, "enforce_eager", False)
+                step_ctx = (jax.disable_jit() if eager else nullcontext())
+                with step_ctx:
+                    (self.kv_caches, hidden_states, aux_hidden_states,
+                     expert_indices) = self.model_fn(
+                         self.state_leaves,
+                         self.kv_caches,
+                         input_ids,
+                         attn_metadata,
+                         inputs_embeds,
+                         input_positions,
+                         tuple(self.layer_name_to_kvcache_index.items()),
+                         lora_metadata,
+                         intermediate_tensors,
+                         self.is_first_rank,
+                         self.is_last_rank,
+                         shared_attention_metadata=shared_attn_metadata,
+                     )
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output

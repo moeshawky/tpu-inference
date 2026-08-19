@@ -329,6 +329,8 @@ def test_memory_guard_uses_cgroup_snapshot(monkeypatch):
             "cgroup_available": 71 * (1 << 30),
             "proc_available": 381 * (1 << 30),
             "available": 71 * (1 << 30),
+            "cgroup_committed": 259 * (1 << 30),
+            "cgroup_reclaimable_file": 0,
         })
 
     with pytest.raises(RuntimeError, match="host memory guard refused"):

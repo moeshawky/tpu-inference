@@ -431,6 +431,13 @@ class DPScheduler(SchedulerInterface):
         self.log_stats = log_stats
         self.connector = None
         self.ec_connector = None
+        if vllm_config.ec_transfer_config is not None:
+            from vllm.distributed.ec_transfer.ec_connector.base import \
+                ECConnectorRole
+            from vllm.distributed.ec_transfer.ec_connector.factory import \
+                ECConnectorFactory
+            self.ec_connector = ECConnectorFactory.create_connector(
+                config=vllm_config, role=ECConnectorRole.SCHEDULER)
         self.structured_output_manager = structured_output_manager
 
         # DP state

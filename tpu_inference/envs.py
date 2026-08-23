@@ -92,6 +92,23 @@ if TYPE_CHECKING:
     MOE_EXPERT_OFFLOAD_DISK_BACKED: bool = False
     MOE_EXPERT_OFFLOAD_PACKED_HOST: bool = False
     MOE_EXPERT_OFFLOAD_STORAGE_DIR: str = "/kaggle/temp/moe_expert_banks"
+    # Design D (store-first hybrid): canonical file-backed TPU-ready expert
+    # store. When enabled (with MOE_EXPERT_OFFLOAD), each offloaded layer's
+    # processed records are written to one mmap'able file per layer and the
+    # persistent expert representation is that file (reclaimable page cache),
+    # NOT a second full anonymous host bank. See rearch-design/converge.md.
+    MOE_EXPERT_OFFLOAD_STORE: bool = True
+    MOE_EXPERT_OFFLOAD_STORE_DIR: str = "/kaggle/temp/dsv4_expert_store"
+    # Miss refresh strategy for store-backed banks: "scatter" (per-row
+    # device_put + .at[slot].set(), no host slot mirror) or "full"
+    # (proven full-array device_put with a packed S-slot host mirror).
+    MOE_EXPERT_OFFLOAD_PUSH_MODE: str = "scatter"
+    # Optional bounded in-memory cache of raw store records (GiB, 0 = off).
+    MOE_EXPERT_OFFLOAD_HOT_CACHE_GIB: int = 0
+    # Debug mode (Design C): just-in-time per-expert transform from the raw
+    # checkpoint on miss. Not implemented in the Design D branch; selecting
+    # it while the store is disabled fails loudly at registration.
+    MOE_EXPERT_OFFLOAD_RAW_JIT: bool = False
 
 
 def env_with_choices(
@@ -520,6 +537,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_EXPERT_OFFLOAD_STORAGE_DIR":
     lambda: os.getenv("MOE_EXPERT_OFFLOAD_STORAGE_DIR",
                       "/kaggle/temp/moe_expert_banks"),
+    # Design D: file-backed canonical expert store (one record per expert,
+    # byte-identical slices of the processed GMM-layout arrays). Default on;
+    # MOE_EXPERT_OFFLOAD_STORE=0 restores the anonymous bank path.
+    "MOE_EXPERT_OFFLOAD_STORE":
+    env_bool("MOE_EXPERT_OFFLOAD_STORE", default=True),
+    "MOE_EXPERT_OFFLOAD_STORE_DIR":
+    lambda: os.getenv("MOE_EXPERT_OFFLOAD_STORE_DIR",
+                      "/kaggle/temp/dsv4_expert_store"),
+    "MOE_EXPERT_OFFLOAD_PUSH_MODE":
+    env_with_choices("MOE_EXPERT_OFFLOAD_PUSH_MODE", "scatter",
+                     ["scatter", "full"]),
+    "MOE_EXPERT_OFFLOAD_HOT_CACHE_GIB":
+    lambda: int(os.getenv("MOE_EXPERT_OFFLOAD_HOT_CACHE_GIB", "0")),
+    "MOE_EXPERT_OFFLOAD_RAW_JIT":
+    env_bool("MOE_EXPERT_OFFLOAD_RAW_JIT", default=False),
     # Controls whether FP8 linear and MoE layers perform incremental weight
     # loading, sharding, and immediate host RAM cleanup. When enabled, weights
     # are sharded and transferred to TPU device memory layer-by-layer (or per

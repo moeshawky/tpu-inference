@@ -111,8 +111,14 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
         cache_config,
         backend_cls=None,
     ):
-        super().__init__(head_dim, window_size, dtype, prefix, cache_config,
-                         backend_cls)
+        # vLLM #47808 added ``backend_cls`` to DeepseekV4SWACache and the base
+        # attention ctor always passes it; None keeps the default SWA backend.
+        super().__init__(head_dim,
+                         window_size,
+                         dtype,
+                         prefix,
+                         cache_config,
+                         backend_cls=backend_cls)
         compressed_kv_cache_bz = cache_config.block_size
         # We would like to overlay the SWA cache with CSA's main NOPE cache
         # on the same KV-Tensor, whose shape is [num_pages, page_size, 4, 128]

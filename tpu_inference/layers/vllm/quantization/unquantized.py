@@ -431,10 +431,18 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
             # (scale args default to None). register_bank returns None for
             # hash-routed layers (shared guard) and when offload is disabled
             # -- fall through to the full shard path in that case.
+            # Design D store-first: MOE_EXPERT_OFFLOAD_STORE=1 (default)
+            # writes the processed records verify-then-publish into the
+            # canonical layer store, then the bank opens that store instead
+            # of keeping the anonymous full-bank mirror.
+            store_path = None
+            if expert_offload.store_enabled():
+                store_path = expert_offload.store_write_layer(
+                    layer.layer_name, weights.w13_weight, weights.w2_weight)
             bank = expert_offload.register_bank(
                 layer.layer_name, weights.w13_weight, weights.w2_weight,
                 self._gmm_tp_w13_sharding(), self._gmm_tp_w2_sharding(),
-                layer=layer)
+                layer=layer, store_path=store_path)
             if bank is not None:
                 layer.w13_weight = Parameter(torch_view(bank.slot_w13),
                                              requires_grad=False)

@@ -60,6 +60,11 @@ def _offload_clean_env(monkeypatch):
     monkeypatch.delenv("MOE_EXPERT_OFFLOAD_HOST_MEMORY_GUARD", raising=False)
     monkeypatch.delenv("MOE_EXPERT_OFFLOAD_HOST_MEMORY_RESERVE_GIB", raising=False)
     monkeypatch.delenv("MOE_EXPERT_OFFLOAD_CPU_WORKING_SET_GIB", raising=False)
+    monkeypatch.delenv("MOE_EXPERT_OFFLOAD_STORE", raising=False)
+    monkeypatch.delenv("MOE_EXPERT_OFFLOAD_STORE_DIR", raising=False)
+    monkeypatch.delenv("MOE_EXPERT_OFFLOAD_PUSH_MODE", raising=False)
+    monkeypatch.delenv("MOE_EXPERT_OFFLOAD_HOT_CACHE_GIB", raising=False)
+    monkeypatch.delenv("MOE_EXPERT_OFFLOAD_RAW_JIT", raising=False)
     expert_offload.clear_all()
     yield
     expert_offload.clear_all()
@@ -356,3 +361,327 @@ def test_scale_args_must_be_a_pair(cpu_mesh, monkeypatch):
             "model.layers.3.ffn.experts", w13, w2, w13_sh, w2_sh,
             w13_scale_host=w13s, w2_scale_host=w2s,
             layer=_FakeLayer())
+
+# ---------------------------------------------------------------------------
+# Design D store-first hybrid — CPU witnesses W0-W3
+# ---------------------------------------------------------------------------
+
+FLOAT4 = np.dtype("float4_e2m1fn")
+
+
+def _make_fp4_data(n_experts=N_EXPERTS):
+    """Synthetic GMM-processed FP4 payloads with per-expert code markers.
+
+    w13/w2 are float4_e2m1fn (itemsize 1; only the low nibble is meaningful),
+    filled with random valid FP4 codes so a corrupted or swapped record can
+    never match by content. Scales are 4-D fp32 with the same per-expert
+    marker discipline as _make_bank_data.
+    """
+    rng = np.random.default_rng(7 + n_experts)
+    w13 = rng.integers(0, 16, size=(n_experts, 16, 1, 64),
+                       dtype=np.uint8).view(FLOAT4)
+    w2 = rng.integers(0, 16, size=(n_experts, 8, 1, 64),
+                      dtype=np.uint8).view(FLOAT4)
+    w13s = rng.random((n_experts, W13_SCALE_BLOCKS, 1, 8),
+                      dtype=np.float32) + (1.0 + np.arange(
+                          n_experts, dtype=np.float32)).reshape(-1, 1, 1, 1)
+    w2s = rng.random((n_experts, W2_SCALE_BLOCKS, 1, 8),
+                     dtype=np.float32) + (10.0 + np.arange(
+                         n_experts, dtype=np.float32)).reshape(-1, 1, 1, 1)
+    return w13, w2, w13s, w2s
+
+
+def _write_test_store(tmp_path, layer_id=3, n_experts=N_EXPERTS):
+    """Write a synthetic FP4 store for layer ``layer_id``; return its path."""
+    w13, w2, w13s, w2s = _make_fp4_data(n_experts)
+    path = tmp_path / f"layer_{layer_id:03d}.rec"
+    record_bytes = expert_offload.write_expert_store(
+        path, layer_id, w13, w2, w13s, w2s)
+    return path, record_bytes, (w13, w2, w13s, w2s)
+
+
+def _enable_store_env(monkeypatch, tmp_path, slots=S_SLOTS,
+                      push_mode="scatter"):
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD", "1")
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_SLOTS", str(slots))
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_STORE", "1")
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_STORE_DIR", str(tmp_path))
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_PUSH_MODE", push_mode)
+
+
+def _store_row(bank, slot, which="w13"):
+    """Device slot row as a uint8/float32 numpy array (for content checks)."""
+    if which == "w13":
+        arr = np.asarray(jax.device_get(bank.slot_w13))[slot]
+    elif which == "w2":
+        arr = np.asarray(jax.device_get(bank.slot_w2))[slot]
+    elif which == "w13s":
+        return np.asarray(jax.device_get(bank.slot_w13_scale))[slot]
+    else:
+        return np.asarray(jax.device_get(bank.slot_w2_scale))[slot]
+    return arr.view(np.uint8)
+
+
+def _expected_unpack(bank, expert_id, which="w13"):
+    """The store record row unpacked to kernel form (the W1 byte contract).
+
+    Weight rows are returned as uint8 FP4 codes (the same canonical view as
+    _store_row) so array_equal compares bytes, not mixed dtypes.
+    """
+    w13_row, w2_row, s13_row, s2_row = bank.store.read_record(expert_id)
+    if which == "w13":
+        return bank._unpack_weight_rows(w13_row, bank._w13_packed).view(np.uint8)
+    if which == "w2":
+        return bank._unpack_weight_rows(w2_row, bank._w2_packed).view(np.uint8)
+    if which == "w13s":
+        return s13_row
+    return s2_row
+
+
+def test_w0_store_roundtrip_fp4_byte_identity(tmp_path):
+    """W0: write -> open -> read every expert; unpacked rows == originals."""
+    path, record_bytes, (w13, w2, w13s, w2s) = _write_test_store(tmp_path)
+    store = expert_offload.open_expert_store(path, 3)
+    try:
+        assert store.n_experts == N_EXPERTS
+        # Exact byte contract: record = w13(16*1*32) + w2(8*1*32)
+        # + s13(16*1*8*4) + s2(8*1*8*4) = 512 + 256 + 512 + 256 = 1536 B.
+        assert store.record_bytes == record_bytes == 1536
+        assert path.stat().st_size == (
+            expert_offload._STORE_HEADER_BYTES + record_bytes * N_EXPERTS)
+        for e in range(N_EXPERTS):
+            w13_row, w2_row, s13_row, s2_row = store.read_record(e)
+            assert np.array_equal(
+                w13_row.view(np.uint8),
+                ((w13[e].view(np.uint8)[..., 0::2] & 0x0F)
+                 | ((w13[e].view(np.uint8)[..., 1::2] & 0x0F) << 4)))
+    finally:
+        store.close()
+
+
+def test_w0_store_roundtrip_content(tmp_path):
+    """W0: unpacked store rows are content-identical to the source arrays."""
+    path, _, (w13, w2, w13s, w2s) = _write_test_store(tmp_path)
+    store = expert_offload.open_expert_store(path, 3)
+    try:
+        for e in range(N_EXPERTS):
+            w13_row, w2_row, s13_row, s2_row = store.read_record(e)
+            unpacked13 = w13_row.view(np.uint8)
+            assert unpacked13.shape == (16, 1, 32)
+            full = np.empty((16, 1, 64), dtype=np.uint8)
+            full[..., 0::2] = unpacked13 & 0x0F
+            full[..., 1::2] = (unpacked13 >> 4) & 0x0F
+            assert np.array_equal(full, w13[e].view(np.uint8))
+            assert np.array_equal(_unpack2(w2_row), w2[e].view(np.uint8))
+            assert np.array_equal(s13_row, w13s[e])
+            assert np.array_equal(s2_row, w2s[e])
+    finally:
+        store.close()
+
+
+def _unpack2(packed_row):
+    full = np.empty(list(packed_row.shape[:-1]) + [packed_row.shape[-1] * 2],
+                    dtype=np.uint8)
+    full[..., 0::2] = packed_row & 0x0F
+    full[..., 1::2] = (packed_row >> 4) & 0x0F
+    return full
+
+
+def test_w0_store_open_time_corruption_detected(tmp_path):
+    """W0: a flipped data byte fails open verification (loud, pre-bank)."""
+    path, _, _ = _write_test_store(tmp_path)
+    size = path.stat().st_size
+    blob = bytearray(path.read_bytes())
+    # Flip one byte inside record 5's weight area.
+    blob[expert_offload._STORE_HEADER_BYTES + 5 * 1536 + 10] ^= 0x01
+    path.write_bytes(bytes(blob))
+    with pytest.raises(expert_offload.ExpertStoreError, match="sha256"):
+        expert_offload.open_expert_store(path, 3)
+    assert path.stat().st_size == size
+
+
+def test_w0_store_header_checks(tmp_path):
+    """W0: bad magic, wrong layer id, and truncation all fail loudly."""
+    path, _, _ = _write_test_store(tmp_path)
+    with pytest.raises(expert_offload.ExpertStoreError, match="layer id"):
+        expert_offload.open_expert_store(path, 4)
+    blob = bytearray(path.read_bytes())
+    blob[0] = 0x00
+    bad = tmp_path / "bad.rec"
+    bad.write_bytes(bytes(blob))
+    with pytest.raises(expert_offload.ExpertStoreError, match="magic"):
+        expert_offload.open_expert_store(bad, 3)
+    trunc = tmp_path / "trunc.rec"
+    trunc.write_bytes(bytes(blob)[:100])
+    with pytest.raises(expert_offload.ExpertStoreError, match="truncated"):
+        expert_offload.open_expert_store(trunc, 3)
+    missing = tmp_path / "missing.rec"
+    with pytest.raises(expert_offload.ExpertStoreError, match="missing"):
+        expert_offload.open_expert_store(missing, 3)
+
+
+def test_w0_store_scale_pairing(tmp_path):
+    """W0: one scale without the other is a write-time contract error."""
+    w13, w2, w13s, w2s = _make_fp4_data()
+    path = tmp_path / "layer_003.rec"
+    with pytest.raises(ValueError, match="together"):
+        expert_offload.write_expert_store(path, 3, w13, w2, w13s, None)
+
+
+def test_w2_store_bank_scatter(tmp_path, cpu_mesh, monkeypatch):
+    """W2: scatter-mode store bank — no host mirror, slots from store."""
+    _enable_store_env(monkeypatch, tmp_path, push_mode="scatter")
+    path, _, _ = _write_test_store(tmp_path)
+    (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
+
+    bank = expert_offload.register_bank(
+        "model.layers.3.ffn.experts",
+        np.zeros((1, 1), dtype=np.float32),
+        np.zeros((1, 1), dtype=np.float32),
+        w13_sh, w2_sh,
+        dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
+        layer=_FakeLayer(), store_path=str(path))
+
+    assert bank is not None
+    assert bank.push_mode == "scatter"
+    # Scatter mode keeps NO host mirror (Design D: anon = O(hot cache)).
+    assert bank.slot13_host is None and bank.slot2_host is None
+    assert bank.slot13_scale_host is None and bank.slot2_scale_host is None
+    # Initial residency from store records 0..S-1, content-verified.
+    for slot in range(S_SLOTS):
+        assert bank.slot_to_expert[slot] == slot
+        assert np.array_equal(_store_row(bank, slot, "w13"),
+                              _expected_unpack(bank, slot, "w13"))
+        assert np.array_equal(_store_row(bank, slot, "w2"),
+                              _expected_unpack(bank, slot, "w2"))
+        assert np.allclose(_store_row(bank, slot, "w13s"),
+                           _expected_unpack(bank, slot, "w13s"))
+    # Eviction: request experts 5 and 6 -> two victims, padding pinned.
+    bank.ensure_resident(np.array([5, 6]))
+    for slot, expert in enumerate(bank.slot_to_expert):
+        assert np.array_equal(_store_row(bank, slot, "w13"),
+                              _expected_unpack(bank, expert, "w13"))
+        assert np.array_equal(_store_row(bank, slot, "w2"),
+                              _expected_unpack(bank, expert, "w2"))
+        assert np.allclose(_store_row(bank, slot, "w13s"),
+                           _expected_unpack(bank, expert, "w13s"))
+        assert np.allclose(_store_row(bank, slot, "w2s"),
+                           _expected_unpack(bank, expert, "w2s"))
+    assert bank.slot_to_expert[0] == 0
+    assert 5 in bank.expert_to_slot and 6 in bank.expert_to_slot
+
+
+def test_w2_store_bank_full_push(tmp_path, cpu_mesh, monkeypatch):
+    """W2: full-push store bank keeps a packed S-slot mirror, refreshes it."""
+    _enable_store_env(monkeypatch, tmp_path, push_mode="full")
+    path, _, _ = _write_test_store(tmp_path)
+    (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
+
+    bank = expert_offload.register_bank(
+        "model.layers.3.ffn.experts",
+        np.zeros((1, 1), dtype=np.float32),
+        np.zeros((1, 1), dtype=np.float32),
+        w13_sh, w2_sh,
+        dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
+        layer=_FakeLayer(), store_path=str(path))
+
+    assert bank is not None
+    assert bank.push_mode == "full"
+    # Packed (storage-form) mirror: uint8, last axis halved vs float4 form.
+    assert bank.slot13_host is not None
+    assert bank.slot13_host.dtype == np.uint8
+    assert bank.slot13_host.shape == (S_SLOTS, 16, 1, 32)
+    assert bank.slot13_scale_host.shape == (
+        S_SLOTS, W13_SCALE_BLOCKS, 1, 8)
+    # Evict slot 1 (expert 1) in favor of expert 7.
+    bank._load_one(slot=1, expert_id=7)
+    assert bank.slot_to_expert[1] == 7
+    assert np.array_equal(bank.slot13_host[1],
+                          bank.store.read_record(7)[0])
+    assert np.array_equal(
+        _store_row(bank, 1, "w13"), _expected_unpack(bank, 7, "w13"))
+    assert np.allclose(_store_row(bank, 1, "w13s"),
+                       _expected_unpack(bank, 7, "w13s"))
+
+
+def test_w3_store_bank_route_gating_consistency(tmp_path, cpu_mesh,
+                                                 monkeypatch):
+    """W3: routing stress — gating maps resident experts without loss.
+
+    Each round concentrates routing on a bounded pool (including the pinned
+    padding expert 0) so the batch union fits S slots, then checks: every
+    selected token's gating value equals its original logit at the mapped
+    slot, unselected slots are -inf, and EVERY resident slot's device
+    content matches its store record (eviction + re-residency across rounds).
+    """
+    _enable_store_env(monkeypatch, tmp_path, push_mode="scatter")
+    path, _, _ = _write_test_store(tmp_path)
+    (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
+    bank = expert_offload.register_bank(
+        "model.layers.3.ffn.experts",
+        np.zeros((1, 1), dtype=np.float32),
+        np.zeros((1, 1), dtype=np.float32),
+        w13_sh, w2_sh,
+        dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
+        layer=_FakeLayer(), store_path=str(path))
+
+    rng = np.random.default_rng(42)
+    # Round 3 re-requests round 1's pool after round 2 evicted it.
+    rounds = [[0, 4, 9, 15], [0, 2, 6, 12], [0, 4, 9, 15]]
+    for pool in rounds:
+        T, TOP_K = 8, 2
+        logits = np.full((T, N_EXPERTS), -10.0, dtype=np.float32)
+        for t in range(T):
+            for e in rng.choice(pool, size=TOP_K, replace=False):
+                logits[t, int(e)] = float(rng.normal(2.0, 1.0))
+        gating = bank.route(logits, TOP_K)
+        assert gating.shape == (T, S_SLOTS)
+        for t in range(T):
+            top_ids = np.argpartition(logits[t], -TOP_K)[-TOP_K:]
+            seen = set()
+            for e in top_ids:
+                e = int(e)
+                s = bank.expert_to_slot[e]
+                assert np.isclose(gating[t, s], logits[t, e])
+                seen.add(s)
+            for s in range(S_SLOTS):
+                if s not in seen:
+                    assert np.isneginf(gating[t, s])
+        # Invariant: every resident slot carries exactly its mapped
+        # expert's store record (weights AND scales).
+        for slot, expert in enumerate(bank.slot_to_expert):
+            assert np.array_equal(_store_row(bank, slot, "w13"),
+                                  _expected_unpack(bank, expert, "w13"))
+            assert np.array_equal(_store_row(bank, slot, "w2"),
+                                  _expected_unpack(bank, expert, "w2"))
+            assert np.allclose(_store_row(bank, slot, "w13s"),
+                               _expected_unpack(bank, expert, "w13s"))
+            assert np.allclose(_store_row(bank, slot, "w2s"),
+                               _expected_unpack(bank, expert, "w2s"))
+
+
+def test_store_register_rejects_hash_routed_and_env_off(tmp_path, cpu_mesh,
+                                                        monkeypatch):
+    """Store path honors the shared guards: hash-routed refuse, env off."""
+    _enable_store_env(monkeypatch, tmp_path)
+    path, _, _ = _write_test_store(tmp_path)
+    (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
+    bank = expert_offload.register_bank(
+        "model.layers.1.ffn.experts",
+        np.zeros((1, 1), dtype=np.float32),
+        np.zeros((1, 1), dtype=np.float32),
+        w13_sh, w2_sh,
+        dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
+        layer=_FakeLayer(hash_indices_table=np.zeros((128, 6))),
+        store_path=str(path))
+    assert bank is None
+    # env off -> None even with a valid store path
+    monkeypatch.delenv("MOE_EXPERT_OFFLOAD")
+    bank2 = expert_offload.register_bank(
+        "model.layers.3.ffn.experts",
+        np.zeros((1, 1), dtype=np.float32),
+        np.zeros((1, 1), dtype=np.float32),
+        w13_sh, w2_sh,
+        dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
+        layer=_FakeLayer(), store_path=str(path))
+    assert bank2 is None

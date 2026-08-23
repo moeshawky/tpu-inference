@@ -267,6 +267,18 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
             # Hash-routed layers are refused inside register_bank (shared
             # choke point covering this gate and the unquantized gate), so a
             # None bank here falls through to the full shard path below.
+            #
+            # Design D store-first: when MOE_EXPERT_OFFLOAD_STORE=1 (default)
+            # the processed records are written verify-then-publish into the
+            # canonical layer store (this load-time transform is the paid
+            # window), then the bank opens that store instead of keeping the
+            # anonymous full-bank mirror. MOE_EXPERT_OFFLOAD_PUSH_MODE
+            # selects scatter (default) / full push behavior.
+            store_path = None
+            if expert_offload.store_enabled():
+                store_path = expert_offload.store_write_layer(
+                    layer.layer_name, weights.w13_weight, weights.w2_weight,
+                    weights.w13_weight_scale, weights.w2_weight_scale)
             bank = expert_offload.register_bank(
                 layer.layer_name, weights.w13_weight, weights.w2_weight,
                 self._gmm_tp_w13_sharding(), self._gmm_tp_w2_sharding(),
@@ -274,7 +286,7 @@ class VllmMxfp4MoEMethod(Mxfp4MoEMethod, FusedMoEMethodBase):
                 w2_scale_host=weights.w2_weight_scale,
                 dev_w13_scale_sharding=self._gmm_tp_w13_scale_sharding(),
                 dev_w2_scale_sharding=self._gmm_tp_w2_scale_sharding(),
-                layer=layer)
+                layer=layer, store_path=store_path)
             if bank is not None:
                 layer.w13_weight = Parameter(torch_view(bank.slot_w13),
                                              requires_grad=False)

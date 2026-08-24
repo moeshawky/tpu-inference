@@ -2560,12 +2560,56 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def _prepare_async_token_substitution_indices(
             self, req_ids_dp, scheduled_tokens_per_dp_rank,
-            padded_num_scheduled_tokens_per_dp_rank, dp_size):
-        """Prepare token substitution indices for async scheduling."""
+            padded_num_scheduled_tokens_per_dp_rank, dp_size,
+            scheduler_output=None):
+        """Prepare token substitution indices for async scheduling.
+
+        Uses scheduler-authoritative state to determine prefill vs decode
+        when available, falling back to input_batch counters for legacy
+        callers (tests). This fixes the case where a prior placeholder
+        (e.g. 127-token chunked prefill) remains in
+        `_pre_async_results` but `input_batch` counters are stale and would
+        mis-classify a prefill as decode, leading to ``assert 127 <= 2``.
+        """
         # For input_ids substitution.
         token_in_tpu_cur_input_indices_dp = {}
         token_in_tpu_pre_next_tokens_indices_dp = {}
         spec_decode_enabled = (self.speculative_config is not None)
+
+        # Scheduler-authoritative lookup tables (None -> fallback to input_batch).
+        if scheduler_output is not None:
+            # New requests are always prefill.
+            new_req_ids = set()
+            if hasattr(scheduler_output, 'scheduled_new_reqs'):
+                for nr in scheduler_output.scheduled_new_reqs:
+                    try:
+                        new_req_ids.add(nr.req_id)
+                    except AttributeError:
+                        # Tests may use MagicMock with dict-like items
+                        pass
+            # Resumed (preempted + recomputed) requests are prefill.
+            resumed_ids = set()
+            cached_req_to_computed = {}
+            spec_map = getattr(scheduler_output,
+                               'scheduled_spec_decode_tokens', None) or {}
+            try:
+                cr = getattr(scheduler_output, 'scheduled_cached_reqs', None)
+                if cr is not None:
+                    if getattr(cr, 'resumed_req_ids', None):
+                        resumed_ids = set(cr.resumed_req_ids)
+                    if hasattr(cr, 'req_ids') and hasattr(
+                            cr, 'num_computed_tokens'):
+                        for idx, rid in enumerate(cr.req_ids):
+                            if idx < len(cr.num_computed_tokens):
+                                cached_req_to_computed[rid] = cr.num_computed_tokens[idx]
+            except Exception:
+                # Be conservative on malformed scheduler_output (tests)
+                pass
+        else:
+            new_req_ids = set()
+            resumed_ids = set()
+            cached_req_to_computed = {}
+            spec_map = {}
 
         for dp_rank in range(dp_size):
             token_in_tpu_cur_input_indices_dp[dp_rank] = []
@@ -2584,9 +2628,57 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             for i, req_id in enumerate(req_ids_dp[dp_rank]):
                 acc_cur_len += num_scheduled_tokens_per_req[i]
 
-                req_idx = self.input_batch.req_id_to_index[req_id]
-                is_prefill = self.input_batch.num_computed_tokens_cpu[
-                    req_idx] < self.input_batch.num_prompt_tokens[req_idx]
+                # Scheduler-authoritative is_prefill when possible.
+                if scheduler_output is not None:
+                    if req_id in new_req_ids:
+                        is_prefill = True
+                    elif req_id in resumed_ids:
+                        is_prefill = True
+                    elif req_id in spec_map:
+                        # Spec verify window is decode, not prefill.
+                        is_prefill = False
+                    elif req_id in cached_req_to_computed:
+                        # Use authoritative computed vs prompt length.
+                        req_state = self.requests.get(
+                            req_id) if hasattr(self, 'requests') else None
+                        prompt_len = None
+                        if req_state is not None and getattr(
+                                req_state, 'prompt_token_ids', None) is not None:
+                            try:
+                                prompt_len = len(req_state.prompt_token_ids)
+                            except Exception:
+                                prompt_len = None
+                        if prompt_len is None:
+                            # Fallback to input_batch if request state unavailable
+                            try:
+                                r_idx = self.input_batch.req_id_to_index[req_id]
+                                prompt_len = int(
+                                    self.input_batch.num_prompt_tokens[r_idx])
+                            except Exception:
+                                prompt_len = None
+                        if prompt_len is not None:
+                            is_prefill = cached_req_to_computed[
+                                req_id] < prompt_len
+                        else:
+                            # No prompt length available: heuristic based on
+                            # token count (prefill is >1 or not in spec).
+                            if not spec_decode_enabled:
+                                is_prefill = num_scheduled_tokens_per_req[i] != 1
+                            else:
+                                is_prefill = (num_scheduled_tokens_per_req[i] != 1
+                                              and req_id not in spec_map)
+                    else:
+                        # Not in scheduler cached/new (e.g. test mock): fallback
+                        try:
+                            req_idx = self.input_batch.req_id_to_index[req_id]
+                            is_prefill = self.input_batch.num_computed_tokens_cpu[
+                                req_idx] < self.input_batch.num_prompt_tokens[req_idx]
+                        except Exception:
+                            is_prefill = False
+                else:
+                    req_idx = self.input_batch.req_id_to_index[req_id]
+                    is_prefill = self.input_batch.num_computed_tokens_cpu[
+                        req_idx] < self.input_batch.num_prompt_tokens[req_idx]
 
                 # We need an explicit `is_prefill` check here because of preemption.
                 # If a request is preempted and immediately resumed, it goes back to
@@ -2766,7 +2858,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 token_in_tpu_pre_next_tokens_indices_dp,
             ) = self._prepare_async_token_substitution_indices(
                 req_ids_dp, scheduled_tokens_per_dp_rank,
-                padded_num_scheduled_tokens_per_dp_rank, dp_size)
+                padded_num_scheduled_tokens_per_dp_rank, dp_size,
+                scheduler_output=scheduler_output)
 
         self.device_buffer.reset()
 

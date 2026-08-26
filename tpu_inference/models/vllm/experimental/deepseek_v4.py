@@ -812,8 +812,16 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
-        loaded_params = loader.load_weights(weights,
+        # Translate legacy skip_substrs=["mtp."] exclusion into explicit
+        # filtering. Upstream AutoWeightsLoader dropped skip_* in favour of
+        # ignore_unexpected_* (which still loads), so we drop matching
+        # checkpoint weights before loading to preserve exclusion. This model
+        # is a plain nn.Module, not a JaxModule, so JaxAutoWeightsLoader's
+        # isinstance(model, JaxModule) assert would reject it -- local
+        # filtering is the correct translation.
+        loader = AutoWeightsLoader(self)
+        filtered_weights = (nw for nw in weights if "mtp." not in nw[0])
+        loaded_params = loader.load_weights(filtered_weights,
                                             mapper=self.hf_to_vllm_mapper)
 
         # Post-load weight surgery goes here.

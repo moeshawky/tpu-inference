@@ -755,6 +755,42 @@ def jax_array_from_reshaped_torch(
         reshape_dims: Optional tuple specifying the shape to reshape the torch weight to before permutation. If None, no reshaping is applied.
         permute_dims: Optional tuple specifying the permutation of dimensions. If None, no-op for 1D tensors and transpose for 2D tensors is applied.
     """
+    # 1-D attention biases (q/k/v_proj.bias) are stored by HuggingFace with only
+    # the *unpadded* number of query/KV heads from the HF config, but the target
+    # JAX param is padded up to the tensor-parallel sharding size via
+    # utils.get_padded_num_heads (e.g. num_kv_heads=2, sharding_size=8 ->
+    # JAX bias is (8, head_dim)). The checkpoint bias is therefore
+    # (num_heads_unpadded * head_dim,), whose element count does NOT match the
+    # 2-D reshape_dims=(num_heads_padded, head_dim). Reshape to the unpadded
+    # head layout first, then move the extra heads to axis 0 and replicate them
+    # to reach the padded count -- mirroring the proven MetadataMap path
+    # (_load_and_shard_weight, bias_pad_keys -> jnp.repeat(...,
+    # sharding_size // num_kv_heads, axis=0)). Replication (not zero-padding)
+    # is required so the padded heads carry the same bias as their real
+    # counterparts under GQA tensor parallelism.
+    if (reshape_dims is not None and torch_weight.ndim == 1
+            and len(reshape_dims) == 2
+            and torch_weight.numel() != reshape_dims[0] * reshape_dims[1]):
+        head_dim = reshape_dims[1]
+        if torch_weight.numel() % head_dim != 0:
+            raise ValueError(
+                f"Cannot lay out 1-D bias of size {torch_weight.numel()} into "
+                f"head_dim={head_dim} for reshape_dims={reshape_dims}")
+        num_unpadded_heads = torch_weight.numel() // head_dim
+        num_padded_heads = reshape_dims[0]
+        if num_padded_heads % num_unpadded_heads != 0:
+            raise ValueError(
+                f"Bias padded head count {num_padded_heads} is not a multiple "
+                f"of unpadded head count {num_unpadded_heads} for "
+                f"reshape_dims={reshape_dims}")
+        repeat = num_padded_heads // num_unpadded_heads
+        torch_weight = torch_weight.reshape(num_unpadded_heads, head_dim)
+        if repeat != 1:
+            torch_weight = torch_weight.repeat_interleave(repeat, dim=0)
+        # torch_weight now already matches reshape_dims; skip the generic
+        # reshape below so we do not double-reshape.
+        reshape_dims = None
+
     if reshape_dims is not None:
         torch_weight = torch_weight.reshape(reshape_dims)
     if permute_dims is None and torch_weight.ndim == 2:
@@ -879,6 +915,15 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
         self.pytorch_pooler = pytorch_pooler
         self.pooler_weights = {}
 
+        # Intercept the legacy exclusion flags (skip_prefixes / skip_substrs)
+        # so we DROP matching checkpoint weights instead of merely suppressing
+        # load errors. Upstream AutoWeightsLoader only understands
+        # ignore_unexpected_*, which still LOADS the weights -- that would
+        # corrupt model state -- so we capture and filter them here and never
+        # forward these kwargs to super().__init__.
+        self._skip_prefixes = list(kwargs.pop("skip_prefixes", None) or [])
+        self._skip_substrs = list(kwargs.pop("skip_substrs", None) or [])
+
         for name, param in model.named_parameters():
             if not hasattr(param, "weight_loader"):
                 # Following are common patterns in standard transformers. To add pattern for modules
@@ -954,6 +999,14 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
         and fuses them. Weights whose fused param does not exist (e.g. the
         vision tower's unfused gate/up projections) fall through unchanged.
         """
+        # Preserve legacy exclusion semantics: drop weights whose name starts
+        # with a skip_prefix or contains a skip_substr BEFORE they reach the
+        # recursive loader. (Upstream removed skip_* in favour of
+        # ignore_unexpected_*, which does NOT exclude -- it only silences
+        # errors -- so we must filter here to avoid loading/overwriting
+        # weights that should stay unloaded, which would corrupt the model.)
+        weights = self._exclude_skipped_weights(weights)
+
         remap = self._packed_remap()
         if not remap:
             # No packed/fused params to route. Skip building the full param
@@ -1004,6 +1057,27 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
                     quant_method.process_weights_after_loading(module)
         jax.clear_caches()
         return autoloaded | routed_loaded
+
+    def _exclude_skipped_weights(self, weights_iter):
+        """Drop checkpoint weights excluded by legacy skip_prefixes/skip_substrs.
+
+        Yields ``(name, tensor)`` pairs for weights that should be loaded,
+        skipping any whose name starts with one of ``self._skip_prefixes`` or
+        contains one of ``self._skip_substrs``. This restores the exclusion
+        behaviour that upstream ``AutoWeightsLoader`` lost when it replaced
+        ``skip_*`` with ``ignore_unexpected_*`` (the latter still loads).
+        """
+        skip_prefixes = self._skip_prefixes
+        skip_substrs = self._skip_substrs
+        if not skip_prefixes and not skip_substrs:
+            yield from weights_iter
+            return
+        for name, weight in weights_iter:
+            if any(name.startswith(p) for p in skip_prefixes):
+                continue
+            if any(s in name for s in skip_substrs):
+                continue
+            yield name, weight
 
     def _add_loadable_non_param_tensors(self, module: JaxModule,
                                         child_params: dict[str, Any]):

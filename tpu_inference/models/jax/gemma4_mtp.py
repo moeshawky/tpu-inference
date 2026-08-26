@@ -619,8 +619,6 @@ class Gemma4MTPForCausalLM(JaxModule, LoadableWithIterator):
         loader = JaxAutoWeightsLoader(
             self,
             pytorch_pooler=pytorch_pooler,
-            skip_prefixes=(["lm_head"]
-                           if not hasattr(self, 'lm_head') else None),
             ignore_unexpected_prefixes=[
                 "model.embed_vision", "model.vision_tower"
             ],

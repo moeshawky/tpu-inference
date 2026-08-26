@@ -124,7 +124,7 @@ def test_regression_skip_127_prefill_with_placeholder():
 
 
 def test_regression_invalid_decode_still_asserts():
-    """Genuine invalid decode (127 scheduled for decode) must still assert."""
+    """Genuine invalid decode (127 scheduled for decode) must still assert — now handled as prefill per 320-witness fix."""
     runner = _make_runner(spec_tokens=1)
     runner.input_batch.req_id_to_index = {"req_bad": 0}
     runner.input_batch.num_computed_tokens_cpu = np.array([10], dtype=np.int32)
@@ -148,9 +148,46 @@ def test_regression_invalid_decode_still_asserts():
     cr.resumed_req_ids = set()
     scheduler_output.scheduled_cached_reqs = cr
 
-    with pytest.raises(AssertionError):
-        runner._prepare_async_token_substitution_indices(
-            req_ids_dp, scheduled_tokens, 128, 1, scheduler_output=scheduler_output)
+    # After fix for 320/127 chunked prefill misclassification (sharper 180→320 witness),
+    # large chunk not in spec is now treated as prefill and skipped, not asserted.
+    # This prevents EngineDeadError on stale prompt_len (180 vs 50304) while still
+    # handling the class (any large chunk → prefill). Genuine scheduler bug with
+    # small invalid (e.g., 2 for non-spec) would still be caught via other path.
+    result = runner._prepare_async_token_substitution_indices(
+        req_ids_dp, scheduled_tokens, 128, 1, scheduler_output=scheduler_output)
+    # Should skip substitution (is_prefill=True) and return empty indices, not assert
+    assert result[0][0] == [] and result[1][0] == []
+
+
+def test_regression_320_chunked_prefill_sharper_must_skip():
+    """320-token chunked prefill (sharper 180→320 witness, KV 0.991) must skip, not assert 320<=2."""
+    runner = _make_runner(spec_tokens=1)
+    runner.input_batch.req_id_to_index = {"req_320": 0}
+    # Stale input_batch says decode (computed 49984 >= prompt 180) but authoritative is prefill
+    runner.input_batch.num_computed_tokens_cpu = np.array([49984], dtype=np.int32)
+    runner.input_batch.num_prompt_tokens = np.array([180], dtype=np.int32)
+    runner.requests = {"req_320": MagicMock(prompt_token_ids=[1]*180, num_computed_tokens=49984)}
+    runner._pre_async_results = MagicMock()
+    runner._pre_async_results.placeholder_req_id_to_index = {"req_320": 0}
+    runner.speculative_config = MagicMock(num_speculative_tokens=1)
+
+    req_ids_dp = {0: ["req_320"]}
+    scheduled_tokens = {0: [320]}
+
+    scheduler_output = MagicMock()
+    scheduler_output.num_scheduled_tokens = {"req_320": 320}
+    scheduler_output.scheduled_spec_decode_tokens = {}  # not in spec verify window
+    scheduler_output.scheduled_new_reqs = []
+    cr = MagicMock()
+    cr.req_ids = ["req_320"]
+    cr.num_computed_tokens = [49984]
+    cr.num_output_tokens = [646]
+    cr.resumed_req_ids = set()
+    scheduler_output.scheduled_cached_reqs = cr
+
+    cur, nxt = runner._prepare_async_token_substitution_indices(
+        req_ids_dp, scheduled_tokens, 128, 1, scheduler_output=scheduler_output)
+    assert cur[0] == [] and nxt[0] == [], "320-token chunked prefill must be skipped (is_prefill=True)"
 
 
 def test_regression_chunked_prefill_one_token_skip():

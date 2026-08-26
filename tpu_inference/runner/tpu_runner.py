@@ -2657,8 +2657,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                             except Exception:
                                 prompt_len = None
                         if prompt_len is not None:
-                            is_prefill = cached_req_to_computed[
-                                req_id] < prompt_len
+                            # Defense-in-depth: large chunk not in spec verify is prefill even if computed >= prompt (stale)
+                            if spec_decode_enabled and num_scheduled_tokens_per_req[i] > self.speculative_config.num_speculative_tokens + 1 and req_id not in spec_map:
+                                is_prefill = True
+                            elif not spec_decode_enabled and num_scheduled_tokens_per_req[i] != 1 and req_id not in spec_map:
+                                is_prefill = True
+                            else:
+                                is_prefill = cached_req_to_computed[
+                                    req_id] < prompt_len
                         else:
                             # No prompt length available: heuristic based on
                             # token count (prefill is >1 or not in spec).
@@ -2668,17 +2674,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                 is_prefill = (num_scheduled_tokens_per_req[i] != 1
                                               and req_id not in spec_map)
                     else:
-                        # Not in scheduler cached/new (e.g. test mock): fallback
-                        try:
-                            req_idx = self.input_batch.req_id_to_index[req_id]
-                            is_prefill = self.input_batch.num_computed_tokens_cpu[
-                                req_idx] < self.input_batch.num_prompt_tokens[req_idx]
-                        except Exception:
-                            is_prefill = False
+                        # Not in scheduler cached/new: large chunk is prefill before stale fallback
+                        if spec_decode_enabled and num_scheduled_tokens_per_req[i] > self.speculative_config.num_speculative_tokens + 1 and req_id not in spec_map:
+                            is_prefill = True
+                        elif not spec_decode_enabled and num_scheduled_tokens_per_req[i] != 1 and req_id not in spec_map:
+                            is_prefill = True
+                        else:
+                            try:
+                                req_idx = self.input_batch.req_id_to_index[req_id]
+                                is_prefill = self.input_batch.num_computed_tokens_cpu[
+                                    req_idx] < self.input_batch.num_prompt_tokens[req_idx]
+                            except Exception:
+                                is_prefill = False
                 else:
-                    req_idx = self.input_batch.req_id_to_index[req_id]
-                    is_prefill = self.input_batch.num_computed_tokens_cpu[
-                        req_idx] < self.input_batch.num_prompt_tokens[req_idx]
+                    # Legacy path without scheduler_output: large chunk is prefill before stale fallback
+                    if spec_decode_enabled and num_scheduled_tokens_per_req[i] > self.speculative_config.num_speculative_tokens + 1:
+                        is_prefill = True
+                    elif not spec_decode_enabled and num_scheduled_tokens_per_req[i] != 1:
+                        is_prefill = True
+                    else:
+                        req_idx = self.input_batch.req_id_to_index[req_id]
+                        is_prefill = self.input_batch.num_computed_tokens_cpu[
+                            req_idx] < self.input_batch.num_prompt_tokens[req_idx]
 
                 # We need an explicit `is_prefill` check here because of preemption.
                 # If a request is preempted and immediately resumed, it goes back to

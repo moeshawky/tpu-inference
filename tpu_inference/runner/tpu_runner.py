@@ -2570,6 +2570,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         (e.g. 127-token chunked prefill) remains in
         `_pre_async_results` but `input_batch` counters are stale and would
         mis-classify a prefill as decode, leading to ``assert 127 <= 2``.
+
+        Defense-in-depth boundary: when speculative decoding is enabled,
+        a request scheduled >= num_speculative_tokens + 1 tokens that is
+        absent from scheduled_spec_decode_tokens is classified as prefill
+        regardless of computed-vs-prompt counters (host-side counters can
+        be stale mid-chunk and read computed >= prompt). The inclusive >=
+        bound catches the remainder of exactly num_speculative_tokens + 1
+        tokens (e.g. 2 with one draft token), which the previous strict >
+        let through to the stale-counter comparison and a silent scatter
+        of substitution indices into prefill positions. Skipped
+        substitutions log at WARNING: prefill skips and missing-placeholder
+        skips.
         """
         # For input_ids substitution.
         token_in_tpu_cur_input_indices_dp = {}
@@ -2658,7 +2670,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                 prompt_len = None
                         if prompt_len is not None:
                             # Defense-in-depth: large chunk not in spec verify is prefill even if computed >= prompt (stale)
-                            if spec_decode_enabled and num_scheduled_tokens_per_req[i] > self.speculative_config.num_speculative_tokens + 1 and req_id not in spec_map:
+                            if spec_decode_enabled and num_scheduled_tokens_per_req[i] >= self.speculative_config.num_speculative_tokens + 1 and req_id not in spec_map:
                                 is_prefill = True
                             elif not spec_decode_enabled and num_scheduled_tokens_per_req[i] != 1 and req_id not in spec_map:
                                 is_prefill = True
@@ -2675,7 +2687,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                               and req_id not in spec_map)
                     else:
                         # Not in scheduler cached/new: large chunk is prefill before stale fallback
-                        if spec_decode_enabled and num_scheduled_tokens_per_req[i] > self.speculative_config.num_speculative_tokens + 1 and req_id not in spec_map:
+                        if spec_decode_enabled and num_scheduled_tokens_per_req[i] >= self.speculative_config.num_speculative_tokens + 1 and req_id not in spec_map:
                             is_prefill = True
                         elif not spec_decode_enabled and num_scheduled_tokens_per_req[i] != 1 and req_id not in spec_map:
                             is_prefill = True
@@ -2688,7 +2700,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                 is_prefill = False
                 else:
                     # Legacy path without scheduler_output: large chunk is prefill before stale fallback
-                    if spec_decode_enabled and num_scheduled_tokens_per_req[i] > self.speculative_config.num_speculative_tokens + 1:
+                    if spec_decode_enabled and num_scheduled_tokens_per_req[i] >= self.speculative_config.num_speculative_tokens + 1:
                         is_prefill = True
                     elif not spec_decode_enabled and num_scheduled_tokens_per_req[i] != 1:
                         is_prefill = True
@@ -2705,9 +2717,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 # for a resumed prefill request.
                 if is_prefill:
                     # Skip substitution for prefill requests (including chunked prefill)
+                    logger.warning(
+                        "Skipping async substitution for prefill %s scheduled=%d",
+                        req_id, num_scheduled_tokens_per_req[i])
                     continue
 
                 if req_id not in self._pre_async_results.placeholder_req_id_to_index:
+                    logger.warning("Skipping placeholder missing %s", req_id)
                     continue
 
                 if not spec_decode_enabled:

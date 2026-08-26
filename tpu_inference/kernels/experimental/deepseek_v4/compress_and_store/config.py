@@ -102,16 +102,16 @@ def physical_page_size(mode: Mode, kv_cache_block_size: int,
     that array (the compressor wrapper's state-cache ``block_size``, and
     ``derive_metadata``) has to agree with it or writes land on the wrong page.
     """
-    # Compressed KV tokens per page (vLLM's ``spec.storage_block_size``).
-    storage_block_size = kv_cache_block_size // compress_ratio
+    # Compressed KV tokens per page (vLLM's ``spec.block_size``).
+    block_size = kv_cache_block_size // compress_ratio
     if mode is Mode.CSA_INDEXER:
         # (N, T // 4, 4, 256) u8
-        return storage_block_size // SLOT_PACK
+        return block_size // SLOT_PACK
     if mode is Mode.CSA:
         # (N, T, 4, 128) u8
-        return storage_block_size
+        return block_size
     # HCA (N, T * 2, 4, 128) u8
-    return storage_block_size * 2
+    return block_size * 2
 
 
 def state_host_page_size(mode: Mode, kv_cache_block_size: int,

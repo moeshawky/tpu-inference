@@ -104,7 +104,7 @@ class TestKVCacheManager:
         kv_cache_tensors = [
             KVCacheTensor(
                 size=num_blocks * page_size_bytes,
-                shared_by=layer_names,
+                layers=layer_names,
             )
         ]
         return KVCacheConfig(
@@ -568,7 +568,7 @@ class TestKVCacheManager:
             kv_cache_tensors.append(
                 KVCacheTensor(
                     size=num_blocks * page_size_bytes,
-                    shared_by=[f'layer.{i}', f'layer.{i+10}'],
+                    layers=[f'layer.{i}', f'layer.{i+10}'],
                 ))
         kv_cache_config = KVCacheConfig(
             num_blocks=num_blocks,
@@ -613,7 +613,7 @@ class TestKVCacheManager:
         kv_cache_tensors = [
             KVCacheTensor(
                 size=num_blocks * page_size_bytes,
-                shared_by=['layer.0'],
+                layers=['layer.0'],
             )
         ]
         kv_cache_config = KVCacheConfig(
@@ -775,7 +775,7 @@ class TestKVCacheManager:
         kv_cache_tensors = [
             KVCacheTensor(
                 size=num_blocks * page_size_bytes,
-                shared_by=[f'layer.{i}'],
+                layers=[f'layer.{i}'],
             ) for i in range(10)
         ]
         kv_cache_config = KVCacheConfig(
@@ -841,7 +841,7 @@ class TestKVCacheManager:
         kv_cache_tensors = [
             KVCacheTensor(
                 size=num_blocks * page_size_bytes,
-                shared_by=[f'layer.{i}'],
+                layers=[f'layer.{i}'],
             ) for i in range(10)
         ]
         kv_cache_config = KVCacheConfig(
@@ -984,7 +984,7 @@ class TestKVCacheManager:
         kv_cache_tensors = [
             KVCacheTensor(
                 size=num_blocks * page_size_bytes,
-                shared_by=layer_names,
+                layers=layer_names,
             )
         ]
 
@@ -1096,7 +1096,7 @@ class TestKVCacheManager:
             kv_cache_spec = self.runner.get_kv_cache_spec()
 
             # Every layer spec (both mamba and attn) is padded to the
-            # per-shared_by sum so vLLM sees a uniform page size and sizes
+            # per-layers sum so vLLM sees a uniform page size and sizes
             # its block pool to match per-layer TPU allocation.
             assert self.runner.cache_config.mamba_page_size_padded == \
                 expected_uniform
@@ -1343,7 +1343,7 @@ class TestKVCacheManager:
         kv_cache_tensors = [
             KVCacheTensor(
                 size=tensor_size,
-                shared_by=layer_names,
+                layers=layer_names,
             )
         ]
         kv_cache_config = KVCacheConfig(
@@ -1371,8 +1371,8 @@ class TestKVCacheManager:
 
         vLLM's hybrid allocator groups Qwen3.5's 40 layers into 4 kv-cache
         groups (1 full-attn + 3 linear-attn/mamba), then builds
-        `group_size=10` `KVCacheTensor`s, each `shared_by` one layer per
-        group (so shared_by has 4 layer names). Block ids are drawn from a
+        `group_size=10` `KVCacheTensor`s, each `layers` one layer per
+        group (so layers has 4 layer names). Block ids are drawn from a
         single shared pool of size `kv_cache_config.num_blocks`. Before the
         fix, per-layer num_blocks on TPU was `tensor.size /
         total_group_page_size` (~vllm_num_blocks / 3.5 for Qwen3.5), so the
@@ -1404,7 +1404,7 @@ class TestKVCacheManager:
             int(np.prod(shape)) * torch.tensor([], dtype=dtype).element_size()
             for shape, dtype in zip(mamba_shapes, mamba_dtypes))
 
-        # 1 full-attn + 3 linear-attn per shared_by, so the spec padding
+        # 1 full-attn + 3 linear-attn per layers, so the spec padding
         # applied by the fix is (1*attn + 3*mamba_unpadded).
         uniform_page_size = attn_page_size + 3 * mamba_unpadded
 
@@ -1428,7 +1428,7 @@ class TestKVCacheManager:
         attn_spec.head_size = attn_spec_head_size
         attn_spec.dtype = attn_spec_dtype
 
-        # 10 shared_by tensors, each holding 1 attn + 3 mamba layers
+        # 10 layers tensors, each holding 1 attn + 3 mamba layers
         # (Qwen3.5: 10 full-attn, 30 linear-attn).
         layer_names_per_tensor = [(f'attn.{i}', f'mamba_a.{i}', f'mamba_b.{i}',
                                    f'mamba_c.{i}') for i in range(10)]
@@ -1448,7 +1448,7 @@ class TestKVCacheManager:
                              kv_cache_spec=mamba_spec),
         ]
         kv_cache_tensors = [
-            KVCacheTensor(size=tensor_size, shared_by=list(names))
+            KVCacheTensor(size=tensor_size, layers=list(names))
             for names in layer_names_per_tensor
         ]
         kv_cache_config = KVCacheConfig(
@@ -1582,7 +1582,7 @@ class TestKVCacheManager:
             block_stride = max(block_stride, offset)
         return [
             KVCacheTensor(size=block_stride * num_blocks,
-                          shared_by=layers_by_offset[offset],
+                          layers=layers_by_offset[offset],
                           offset=offset,
                           block_stride=block_stride)
             for offset in sorted(layers_by_offset)
@@ -1664,7 +1664,7 @@ class TestKVCacheManager:
         assert caches[7].shape == caches[idx_map['model.layers.0.attn']].shape
 
     def test_initialize_kv_cache_ds_v4_packed_overlay(self):
-        # New (post-#48993) packed layout: shared_by groups layers from
+        # New (post-#48993) packed layout: layers groups layers from
         # different cache groups at the same byte offset.
         num_blocks = 32
         groups = self._ds_v4_groups()
@@ -1681,7 +1681,7 @@ class TestKVCacheManager:
         mixed = [
             tensor for tensor in tensors
             if len({group_of[name]
-                    for name in tensor.shared_by}) >= 3
+                    for name in tensor.layers}) >= 3
         ]
         assert mixed, "test setup should produce a mixed offset group"
 
@@ -1714,7 +1714,7 @@ class TestKVCacheManager:
                            for page_size, slots in buckets.items())
         tensors = [
             KVCacheTensor(size=block_stride * num_blocks,
-                          shared_by=slot,
+                          layers=slot,
                           block_stride=block_stride)
             for slots in buckets.values() for slot in slots
         ]

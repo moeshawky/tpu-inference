@@ -150,8 +150,8 @@ class KVCacheManager:
         what the TPU allocates per layer.
 
         For hybrid attention+mamba models, vLLM groups a tensor's memory so
-        that one `KVCacheTensor` is `shared_by` one layer from each kv-cache
-        group (e.g., Qwen3.5: 1 full-attn + 3 linear-attn per shared_by).
+        that one `KVCacheTensor` is `layers` one layer from each kv-cache
+        group (e.g., Qwen3.5: 1 full-attn + 3 linear-attn per layers).
         vLLM's scheduler assumes these layers share a single physical
         tensor at the byte level — each layer's block_table indexes into
         disjoint slots of the same backing allocation, and device kernels
@@ -161,7 +161,7 @@ class KVCacheManager:
         TPU `jax.Array`s are strongly typed, so we cannot overlay an
         attention tensor and a mamba tensor on the same bytes.
         `initialize_kv_cache` therefore allocates one physical array per
-        layer in the `shared_by` group, carving the group's byte budget
+        layer in the `layers` group, carving the group's byte budget
         into separate per-layer tensors. Without the compensation done
         here, vLLM's block pool would hold `num_shared_layers`× more
         block IDs than each per-layer array has slots — the scheduler
@@ -171,7 +171,7 @@ class KVCacheManager:
         slot (corrupted state → gibberish generation).
 
         The fix: set every layer's reported `page_size_padded` equal to the
-        full per-`shared_by` footprint — `num_attn_groups × attn_page +
+        full per-`layers` footprint — `num_attn_groups × attn_page +
         num_mamba_groups × mamba_unpadded`, where `attn_page` is the
         TPU-actual per-block bytes (from `get_attention_page_size_bytes`,
         which accounts for dtype packing like fp8) and `mamba_unpadded` is
@@ -232,7 +232,7 @@ class KVCacheManager:
 
         # Derive vLLM's kv-cache group layout. vLLM splits each type into
         # equal-sized groups of `group_size` layers, then allocates
-        # `group_size` `KVCacheTensor`s, each `shared_by` one layer from
+        # `group_size` `KVCacheTensor`s, each `layers` one layer from
         # every group — so each tensor covers `num_attn_groups +
         # num_mamba_groups` layers.
         #
@@ -778,7 +778,7 @@ class KVCacheManager:
                                     duplicate_shared_layers=False)
             return
 
-        # If this is true, then we'll initialize a new KV cache for each layer in "shared_by"
+        # If this is true, then we'll initialize a new KV cache for each layer in "layers"
         # instead of the default behavior of initializing a single KV cache for each of the
         # shared layers
         duplicate_shared_layers = False
@@ -786,9 +786,9 @@ class KVCacheManager:
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 if any(
                         isinstance(layer_name_to_spec[layer_name], MambaSpec)
-                        for layer_name in kv_cache_tensor.shared_by):
+                        for layer_name in kv_cache_tensor.layers):
                     # TODO (jacobplatin): we should not be replicating the kv cache for each layer and instead
-                    # should follow the native GPU/Torch approach where every group of layers (shared_by)
+                    # should follow the native GPU/Torch approach where every group of layers (layers)
                     # shares the same underlying raw tensor.
                     logger.warning_once(
                         "MambaSpec does not support shared layers for now, defaulting to single KV cache per layer..."
@@ -796,22 +796,22 @@ class KVCacheManager:
                     duplicate_shared_layers = True
                     non_mtp_tensors = [
                         t for t in kv_cache_config.kv_cache_tensors
-                        if not any("mtp" in name for name in t.shared_by)
+                        if not any("mtp" in name for name in t.layers)
                     ]
                     if non_mtp_tensors:
                         # assert that each kv_cache_tensor in kv_cache_config.kv_cache_tensors has the same number of shared layers
                         # This is needed for models like Qwen3.5 where every 4 layers share the same KV cache (3 linear attn and 1 full attn)
-                        num_shared_layers = len(non_mtp_tensors[0].shared_by)
+                        num_shared_layers = len(non_mtp_tensors[0].layers)
                         for kv_cache_tensor in non_mtp_tensors:
                             assert len(
-                                kv_cache_tensor.shared_by
-                            ) == num_shared_layers, f"Expected all non-MTP kv_cache_tensors to have the same number of shared layers {num_shared_layers}, but found {len(kv_cache_tensor.shared_by)}"
+                                kv_cache_tensor.layers
+                            ) == num_shared_layers, f"Expected all non-MTP kv_cache_tensors to have the same number of shared layers {num_shared_layers}, but found {len(kv_cache_tensor.layers)}"
                     break
 
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
             if duplicate_shared_layers:
                 total_group_page_size = 0
-                for name in kv_cache_tensor.shared_by:
+                for name in kv_cache_tensor.layers:
                     spec = layer_name_to_spec[name]
                     # Use the per-layer *TPU-actual* per-block bytes so the
                     # sum equals the `page_size_padded` that
@@ -847,7 +847,7 @@ class KVCacheManager:
                 # If sharing KV cache, compute `num_blocks` using the page size
                 # of the first layer.
                 page_size_bytes = layer_name_to_spec[
-                    kv_cache_tensor.shared_by[0]].page_size_bytes
+                    kv_cache_tensor.layers[0]].page_size_bytes
                 assert kv_cache_tensor.size % page_size_bytes == 0
                 num_blocks = kv_cache_tensor.size // page_size_bytes
 
@@ -875,7 +875,7 @@ class KVCacheManager:
             if self.actual_mamba_num_blocks is None:
                 self.actual_mamba_num_blocks = mamba_num_blocks
 
-            for j, layer_name in enumerate(kv_cache_tensor.shared_by):
+            for j, layer_name in enumerate(kv_cache_tensor.layers):
                 layer_spec = layer_name_to_spec[layer_name]
                 if isinstance(layer_spec, MambaSpec):
                     mamba_states = []
@@ -917,12 +917,12 @@ class KVCacheManager:
 
                     kv_caches.append(tuple(mamba_states))
                 else:
-                    # We should only init a new kv cache for the first layer in shared_by
+                    # We should only init a new kv cache for the first layer in layers
                     # if duplicate_shared_layers is False.  Otherwise, if duplicate_shared_layers
-                    # is True, we should init a new kv cache for each layer in shared_by
+                    # is True, we should init a new kv cache for each layer in layers
                     if j == 0 or duplicate_shared_layers:
                         # NOTE: we'll multiply the num_kv_heads by 2 in the function
-                        block_size = layer_spec.storage_block_size
+                        block_size = layer_spec.block_size
 
                         kv_cache = create_kv_caches(
                             num_blocks=num_blocks,
@@ -943,9 +943,9 @@ class KVCacheManager:
                             metadata["regular_attn"].dtype = kv_cache.dtype
                             metadata[
                                 "regular_attn"].sharding = kv_cache.sharding
-                # We should only add the blocks for the first layer in shared_by
+                # We should only add the blocks for the first layer in layers
                 # if duplicate_shared_layers is False.  Otherwise, if duplicate_shared_layers
-                # is True, we should add the blocks for each layer in shared_by.
+                # is True, we should add the blocks for each layer in layers.
                 if j == 0 or duplicate_shared_layers:
                     num_blocks_list.append(mamba_num_blocks if isinstance(
                         layer_spec, MambaSpec) else num_blocks)
@@ -1032,7 +1032,7 @@ class KVCacheManager:
         Since vLLM #48993 (``_get_packed_kv_cache_layout``), DSv4's cache
         groups are laid out densely in one shared block slab: every
         ``KVCacheTensor`` spans the whole slab (``size == block_stride *
-        num_blocks``) and its ``shared_by`` lists the layers -- from
+        num_blocks``) and its ``layers`` lists the layers -- from
         *different* cache groups -- that start at the same byte ``offset``.
         A block ID is owned by one cache group at a time, so same-offset
         layers may alias memory, and mixed groups (e.g. an indexer k_cache
@@ -1048,7 +1048,7 @@ class KVCacheManager:
         - Every ``MLAAttentionSpec`` layer gets its own uint8
           ``(num_blocks, rows, 4, lanes)`` array, shaped for the kernel that
           reads it rather than by the generic ``head_size`` formula (with
-          ``T = spec.storage_block_size`` tokens per page):
+          ``T = spec.block_size`` tokens per page):
 
             CSA ``*.attn``        NoPE ``(N, T, 4, 128)``  512B/token
                                   RoPE ``(N, T/4, 4, 128)`` 128B/token, in a
@@ -1081,13 +1081,13 @@ class KVCacheManager:
                         f"of block_stride: size={tensor.size}, "
                         f"block_stride={tensor.block_stride}, "
                         f"offset={tensor.offset}, "
-                        f"shared_by={tensor.shared_by}")
+                        f"layers={tensor.layers}")
                 num_blocks_candidates.add(tensor.size // tensor.block_stride)
             else:
                 # Legacy layout without a packed slab: the tensor is sized
                 # for its own layers' page size.
                 page_size = layer_name_to_spec[
-                    tensor.shared_by[0]].page_size_bytes
+                    tensor.layers[0]].page_size_bytes
                 num_blocks_candidates.add(tensor.size // page_size)
         if len(num_blocks_candidates) != 1:
             raise ValueError(
@@ -1162,7 +1162,7 @@ class KVCacheManager:
         hca_layer_names: set[str] = set()
         for layer_name in mla_layer_names:
             spec = layer_name_to_spec[layer_name]
-            page_size = spec.storage_block_size * common_utils.get_mesh_shape_product(
+            page_size = spec.block_size * common_utils.get_mesh_shape_product(
                 self.runner.mesh, ShardingAxisName.KV_CONTEXT)
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
                 # Lightning indexer: 128 fp8 values + 1 e8m0 scale per token,

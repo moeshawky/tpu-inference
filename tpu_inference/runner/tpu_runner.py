@@ -1629,8 +1629,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # NOTE(pooyam): There is no guarantee that scheduler is not sending empty output: https://github.com/vllm-project/vllm/blob/7cfea0df390c154c1026f77d3682e2733ca4aca8/vllm/v1/engine/core.py#L275
             # Why they are not preventing that is not clear to me.
             if len(scheduler_output.finished_req_ids) == 0:
-                logger.warning(
-                    "Should not schedule a request that does nothing!")
+                # Idle engine step (no requests scheduled, none finished) is an
+                # expected empty cycle in vLLM V1 — the scheduler may emit empty
+                # outputs between steps. Upstream comments out the raise because
+                # this is non-fatal; downgrade from warning to debug to avoid
+                # flooding logs/CPU during idle. A real "request exists but
+                # schedules 0 tokens" anomaly would still surface via the
+                # scheduler, not here.
+                logger.debug(
+                    "Empty scheduler output (no tokens scheduled, no finished "
+                    "requests) — idle cycle, skipping forward.")
                 # raise Exception(
                 #     "Should not schedule a request that does nothing!")
             return EMPTY_MODEL_RUNNER_OUTPUT

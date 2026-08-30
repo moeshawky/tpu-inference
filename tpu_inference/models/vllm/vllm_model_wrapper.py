@@ -504,6 +504,18 @@ class VllmModelWrapper:
             ),
         )
 
+        # Eager mode for host-orchestrated MoE expert banks (see tpu_runner.py:1714).
+        # The bank's host routing does jax.device_get -> numpy inside moe.py:174,
+        # which is illegal under jit (TracerArrayConversionError). When
+        # --enforce-eager, bypass jit so routing sees concrete arrays.
+        if getattr(self.vllm_config.model_config, "enforce_eager", False):
+            def _eager_step(*args, **kwargs):
+                with jax.disable_jit():
+                    return step_fun_impl(*args, **kwargs)
+            # Preserve jit signatures for runner but execute eagerly
+            self.step_fn_no_options = _eager_step
+            return _eager_step
+
         step_fun_no_options = step_fun_jit(step_fun_impl)
 
         step_fun_with_options = step_fun_jit(

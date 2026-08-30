@@ -210,7 +210,7 @@ def outer_kernel(
             cfg=cfg,
         ))
 
-    num_tiles = metadata_ref.num_tiles[...]
+    num_tiles = jnp.asarray(metadata_ref.num_tiles[...], dtype=jnp.int32)
 
     pipeline_func = pltpu.emit_pipeline(
         body=functools.partial(

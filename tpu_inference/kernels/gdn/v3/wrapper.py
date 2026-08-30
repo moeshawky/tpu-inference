@@ -194,6 +194,7 @@ def outer_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
+    host_num_tiles: jax.Array | None = None,
 ):
     """Setup memory allocations and emit pipeline for running inner_kernel."""
     del conv_state_out_ref, recurrent_state_out_ref
@@ -210,7 +211,13 @@ def outer_kernel(
             cfg=cfg,
         ))
 
-    num_tiles = jnp.asarray(metadata_ref.num_tiles[...], dtype=jnp.int32)
+    # Host-computed num_tiles captured as JAX scalar avoids SMEM Ref<vmem> tracer
+    # that leaks 5D window_ref shape [2,4,1,1,1280] into lax.fori_loop.
+    # Fallback to SMEM read for backward compat if host not provided.
+    if host_num_tiles is not None:
+        num_tiles = host_num_tiles
+    else:
+        num_tiles = metadata_ref.num_tiles[...]
 
     pipeline_func = pltpu.emit_pipeline(
         body=functools.partial(
@@ -499,6 +506,9 @@ def fused_conv1d_gdn(
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
+        # Host scalar for pipeline grid: avoid SMEM Ref tracer that leaks VMEM shape
+        host_num_tiles = metadata_obj.num_tiles
+
         # Step 7: Handle case where write needs to be done in existing out.
         in_out_spec = None
         input_output_aliases = {
@@ -515,7 +525,7 @@ def fused_conv1d_gdn(
             input_output_aliases[len(metadata_obj) + 5] = 0
 
         return pl.pallas_call(
-            functools.partial(outer_kernel, cfg=cfg),
+            functools.partial(outer_kernel, cfg=cfg, host_num_tiles=host_num_tiles),
             out_shape=(out_shape, in_conv_state, in_recurrent_state),
             in_specs=(
                 metadata_spec,

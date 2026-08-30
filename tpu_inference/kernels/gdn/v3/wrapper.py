@@ -33,12 +33,12 @@ def inner_kernel(
     # Outputs.
     out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
     # Scratches.
-    metadata_ref: memory_ref.MetadataRef,
-    weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
+    metadata_ref: memory_ref.MetadataRef,
+    weights_ref: memory_ref.WeightRefs,
 ):
     """Orchestrates computation of Conv1D and GDN for a single tile.
 
@@ -223,6 +223,8 @@ def outer_kernel(
         body=functools.partial(
             inner_kernel,
             cfg=cfg,
+            metadata_ref=metadata_ref,
+            weights_ref=weights_ref,
         ),
         grid=(num_tiles, ),
         in_specs=(
@@ -252,8 +254,6 @@ def outer_kernel(
             recurrent_state_ref,
             out_ref,
             scratches=(
-                metadata_ref,
-                weights_ref,
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
             ),

@@ -15,6 +15,8 @@
 import ctypes
 import ctypes.util
 import gc
+import os
+from pathlib import Path
 from typing import Optional, Union
 
 import jax
@@ -47,6 +49,7 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
 from tpu_inference.layers.common.quant_methods import FP8
 from tpu_inference.layers.common.quantization import fp8 as common_fp8
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.vllm import expert_offload
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
 from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
@@ -380,6 +383,22 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
     def is_monolithic(self) -> bool:
         return True
 
+    def _gmm_tp_w13_sharding(self) -> NamedSharding:
+        """GMM_TP w13 layout: shard the last (MLP_TENSOR) axis."""
+        return NamedSharding(self.mesh, P(ShardingAxisName.MLP_TENSOR))
+
+    def _gmm_tp_w2_sharding(self) -> NamedSharding:
+        """GMM_TP w2 layout: shard the middle (MLP_TENSOR) axis."""
+        return NamedSharding(self.mesh, P(None, ShardingAxisName.MLP_TENSOR, None))
+
+    def _gmm_tp_w13_scale_sharding(self) -> NamedSharding:
+        """GMM_TP w13 block-scale layout: shard last axis (4-D)."""
+        return NamedSharding(self.mesh, P(None, None, None, ShardingAxisName.MLP_TENSOR))
+
+    def _gmm_tp_w2_scale_sharding(self) -> NamedSharding:
+        """GMM_TP w2 block-scale layout: shard block axis (4-D)."""
+        return NamedSharding(self.mesh, P(None, ShardingAxisName.MLP_TENSOR, None, None))
+
     def maybe_process_weights(self, layer: torch.nn.Module, param_name: str,
                               args, kwargs):
         """Check if all weights are loaded for the MoE layer.
@@ -423,6 +442,68 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
             return
         assert isinstance(layer, RoutedExperts)
         assert not self.moe.has_bias
+
+        # --- Bank-direct fast path: use read-only .bank files if available ---
+        # Banks are raw FP8 stacks at /kaggle/input/datasets/moeshawky/qwen38-flash-expert-banks/layer_*.bank
+        # Each bank: torch.save({"gate":[512,640,2560] f8, "up", "down", "gate_scale":[512,5,20] bf16, ...})
+        # Fusing gate+up -> w13 [512,1280,2560], down -> w2 [512,2560,640]
+        bank_dir = os.environ.get("QWEN_BANK_DIR", "/kaggle/input/datasets/moeshawky/qwen38-flash-expert-banks")
+        # Also honor MOE_EXPERT_OFFLOAD_STORAGE_DIR if it contains .bank files (legacy)
+        if not os.path.exists(os.path.join(bank_dir, "layer_000.bank")):
+            alt = os.environ.get("MOE_EXPERT_OFFLOAD_STORAGE_DIR", "")
+            if alt and os.path.exists(os.path.join(alt, "layer_000.bank")):
+                bank_dir = alt
+        bank_path = None
+        try:
+            layer_id = expert_offload.parse_layer_id(layer.layer_name)
+            cand = Path(bank_dir) / f"layer_{layer_id:03d}.bank"
+            if cand.exists():
+                bank_path = cand
+        except Exception:
+            bank_path = None
+
+        # If bank exists and offload is enabled, replace checkpoint tensors with bank tensors
+        # to avoid scattered safetensor I/O and to keep host RAM bounded.
+        if bank_path is not None and expert_offload.offload_enabled() and expert_offload.layer_enabled(layer.layer_name):
+            try:
+                obj = torch.load(str(bank_path), map_location="cpu", weights_only=False)
+                gate = obj["gate"]
+                up = obj["up"]
+                down = obj["down"]
+                gate_scale = obj["gate_scale"]
+                up_scale = obj["up_scale"]
+                down_scale = obj["down_scale"]
+                # Fuse gate+up on intermediate dim
+                w13_weight_bank = torch.cat([gate, up], dim=1)
+                w13_scale_bank = torch.cat([gate_scale, up_scale], dim=1)
+                w2_weight_bank = down
+                w2_scale_bank = down_scale
+                # Overwrite layer params before normal _load path - must use Parameter
+                try:
+                    _free_torch_storage(layer.w13_weight)
+                    _free_torch_storage(layer.w2_weight)
+                    _free_torch_storage(getattr(layer, f"w13_{self.weight_scale_name}", None))
+                    _free_torch_storage(getattr(layer, f"w2_{self.weight_scale_name}", None))
+                except Exception:
+                    pass
+                # Remove old params then register new ones as Parameter (handles Float8 correctly)
+                for name in ["w13_weight", "w2_weight", f"w13_{self.weight_scale_name}", f"w2_{self.weight_scale_name}"]:
+                    if hasattr(layer, name):
+                        try:
+                            delattr(layer, name)
+                        except Exception:
+                            pass
+                        layer._parameters.pop(name, None)
+                layer.register_parameter("w13_weight", Parameter(w13_weight_bank, requires_grad=False))
+                layer.register_parameter("w2_weight", Parameter(w2_weight_bank, requires_grad=False))
+                layer.register_parameter(f"w13_{self.weight_scale_name}", Parameter(w13_scale_bank, requires_grad=False))
+                layer.register_parameter(f"w2_{self.weight_scale_name}", Parameter(w2_scale_bank, requires_grad=False))
+                # Also ensure weight_loader attrs are set to allow _load_weight_for_layer to succeed
+                # Use set_weight_attrs pattern from vLLM - minimal
+                logger.info(f"[fp8-bank] layer {layer.layer_name} loaded from {bank_path} w13 {w13_weight_bank.shape} w2 {w2_weight_bank.shape}")
+            except Exception as e:
+                import traceback
+                logger.warning(f"[fp8-bank] failed to load {bank_path}: {e} — falling back to checkpoint\n{traceback.format_exc()}")
 
         ep_sharding = NamedSharding(self.mesh, P(ShardingAxisName.EXPERT))
 
@@ -472,6 +553,68 @@ class VllmFp8MoEMethod(vllm_fp8.Fp8MoEMethod, VllmQuantizationMethod):
         delattr(layer, scale_w2_name)
 
         del w13_weight, w2_weight, w13_weight_scale, w2_weight_scale, input_weights
+
+        # --- Host-backed expert offload: S-slot cache to bypass HBM 200M wall ---
+        if expert_offload.offload_enabled() and expert_offload.layer_enabled(layer.layer_name):
+            try:
+                source_bytes = 0
+                # estimate from processed weights (already on TPU mesh, need host nbytes)
+                # use mesh-sharded sizes * num_experts as approximation
+                # fallback to bank file size if available
+                if bank_path is not None and bank_path.exists():
+                    source_bytes = int(bank_path.stat().st_size)
+                else:
+                    # approximate: w13 [512,1280,2560] f8 + w2 [512,2560,640] f8 + scales
+                    source_bytes = 512 * (1280*2560 + 2560*640 + 10*20*2 + 20*5*2)
+                expert_offload.check_host_memory_budget(layer.layer_name, source_bytes)
+            except Exception as e:
+                logger.warning(f"[expert-offload] host memory guard failed for {layer.layer_name}: {e}")
+                # fall through to normal HBM path if guard refuses? else raise
+                raise
+            store_path = None
+            if expert_offload.store_enabled():
+                try:
+                    store_path = expert_offload.store_write_layer(
+                        layer.layer_name, weights.w13_weight, weights.w2_weight,
+                        weights.w13_weight_scale, weights.w2_weight_scale)
+                except Exception as e:
+                    logger.warning(f"[expert-offload] store_write_layer failed for {layer.layer_name}: {e} — using anonymous host bank")
+                    store_path = None
+            try:
+                # Fix scale sharding for FP8: w2 scale shape (E,1,1,hidden) has dim1=1, cannot shard on MLP_TENSOR
+                # Mirror logic from moe_weights._get_moe_weight_shardings: use replicated sharding when dim1==1
+                w13_scale_sharding = self._gmm_tp_w13_scale_sharding()
+                w2_scale_sharding = self._gmm_tp_w2_scale_sharding()
+                try:
+                    if weights.w2_weight_scale is not None and weights.w2_weight_scale.shape[1] == 1:
+                        w2_scale_sharding = NamedSharding(self.mesh, P())
+                    if weights.w13_weight_scale is not None:
+                        # w13 scale last dim may be 1024, ok to shard; but if dim1==1 also check
+                        # keep w13 as is (shards on last dim)
+                        pass
+                except Exception:
+                    pass
+                bank = expert_offload.register_bank(
+                    layer.layer_name, weights.w13_weight, weights.w2_weight,
+                    self._gmm_tp_w13_sharding(), self._gmm_tp_w2_sharding(),
+                    w13_scale_host=weights.w13_weight_scale,
+                    w2_scale_host=weights.w2_weight_scale,
+                    dev_w13_scale_sharding=w13_scale_sharding,
+                    dev_w2_scale_sharding=w2_scale_sharding,
+                    layer=layer, store_path=store_path)
+                if bank is not None:
+                    layer.w13_weight = Parameter(torch_view(bank.slot_w13), requires_grad=False)
+                    layer.w2_weight = Parameter(torch_view(bank.slot_w2), requires_grad=False)
+                    setattr(layer, scale_w13_name, Parameter(torch_view(bank.slot_w13_scale), requires_grad=False))
+                    setattr(layer, scale_w2_name, Parameter(torch_view(bank.slot_w2_scale), requires_grad=False))
+                    jax.effects_barrier()
+                    del weights
+                    gc.collect()
+                    _release_host_memory()
+                    return
+            except Exception as e:
+                logger.warning(f"[expert-offload] register_bank failed for {layer.layer_name}: {e} — falling back to HBM")
+                # fall through
 
         weights = torch_view(
             shard_moe_weights(weights, self.moe_backend, self.mesh))

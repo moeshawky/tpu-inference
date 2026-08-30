@@ -348,6 +348,42 @@ class VllmModelWrapper:
         return params, lora_manager
 
     def jit_step_func(self):
+        """Build and return the model step function.
+
+        Returns:
+            Callable with signature
+            ``(params_and_buffers, kv_caches, input_ids, attn_metadata,
+            input_embeds, input_positions, layer_name_to_kvcache_index,
+            lora_metadata, intermediate_tensors, is_first_rank, is_last_rank,
+            **kwargs)`` returning
+            ``(kv_caches, hidden_states, aux_hidden_states,
+            expert_indices)`` (the draft-model variant takes
+            ``hidden_states`` instead of ``input_embeds``/
+            ``input_positions`` and returns a prenorm aux list).
+
+            - compiled path (default): ``jax.jit``-ed ``step_fun_impl`` with
+              ``out_shardings`` / ``donate_argnames("kv_caches")`` /
+              ``static_argnames`` set; ``self.step_fn_no_options`` holds the
+              options-free twin used by ``continue_decode``.
+            - ``enforce_eager`` path: the raw, UN-JITTED ``step_fun_impl`` —
+              bypassing the *outer* jit only, WITHOUT
+              ``with jax.disable_jit()``. Concrete arrays keep
+              host-orchestrated MoE expert-bank routing legal
+              (``jax.device_get`` → numpy at
+              layers/vllm/interface/moe.py:174; a Jit tracer would raise
+              ``TracerArrayConversionError``) while the *nested* ``@jax.jit``
+              Pallas kernels (GDN v3 ``fused_conv1d_gdn``) stay active — a
+              blanket ``jax.disable_jit()`` would suppress those too and leak
+              ``BufferedRef<vmem>`` through ``lax.fori_loop``
+              (``Ref<vmem>[2,4,1,1,1280]``).
+
+        Invariant:
+            The runner dispatches to this callable via ``self.model_fn``
+            (runner/tpu_runner.py:1256); in eager mode it MUST call it under
+            ``nullcontext()`` — see
+            ``runner/tpu_runner.py`` ``TPUModelRunner._execute_model`` eager
+            gate.
+        """
 
         def step_fun_impl(
             params_and_buffers,  # This has been wrapped into torchax TorchValue
@@ -507,11 +543,14 @@ class VllmModelWrapper:
         # Eager mode for host-orchestrated MoE expert banks (see tpu_runner.py:1714).
         # The bank's host routing does jax.device_get -> numpy inside moe.py:174,
         # which is illegal under jit (TracerArrayConversionError). When
-        # --enforce-eager, bypass jit so routing sees concrete arrays.
+        # --enforce-eager, bypass the *outer* jit so routing sees concrete
+        # arrays, but keep nested @jax.jit kernels (GDN v3 fused_conv1d_gdn
+        # pallas pipeline) active. Using jax.disable_jit() here would also
+        # disable those nested jits and expose BufferedRef<vmem> through
+        # lax.fori_loop (Ref<vmem>[2,4,1,1,1280]).
         if getattr(self.vllm_config.model_config, "enforce_eager", False):
             def _eager_step(*args, **kwargs):
-                with jax.disable_jit():
-                    return step_fun_impl(*args, **kwargs)
+                return step_fun_impl(*args, **kwargs)
             # Preserve jit signatures for runner but execute eagerly
             self.step_fn_no_options = _eager_step
             return _eager_step

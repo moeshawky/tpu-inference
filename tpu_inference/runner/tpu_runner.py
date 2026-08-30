@@ -1612,6 +1612,44 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         scheduler_output: "VllmSchedulerOutput",
         intermediate_tensors: Optional[JaxIntermediateTensors] = None,
     ) -> JaxIntermediateTensors | ModelRunnerOutput | None:
+        """Run one model step for the scheduled batch.
+
+        Args:
+            scheduler_output: Scheduler decision for this step (which requests
+                run, how many tokens each).
+            intermediate_tensors: Activations from the previous tensor-parallel
+                rank; ``None`` on the first rank.
+
+        Returns:
+            ``EMPTY_MODEL_RUNNER_OUTPUT`` when nothing is scheduled (idle
+            cycle); a ``JaxIntermediateTensors`` (with
+            ``kv_connector_output`` / ``expert_indices`` attached) when this
+            is not the last TP rank; a ``ModelRunnerOutput`` with
+            ``pooler_output`` for pooling models; ``None`` on the last rank
+            for generation models, with the step state stashed in
+            ``self.execute_model_state`` for the sampling phase.
+
+        Raises:
+            ValueError: prompt_logprobs requested for a multimodal model or
+                with speculative decoding.
+
+        Eager-gate semantics (enforce_eager):
+            - vLLM wrapper path: ``self.model_fn`` is already the un-jitted
+              ``_eager_step`` from ``VllmModelWrapper.jit_step_func``
+              (models/vllm/vllm_model_wrapper.py:515), so the step is called
+              under ``nullcontext()`` — no outer jit, and the *nested*
+              ``@jax.jit`` Pallas kernels (GDN v3 ``fused_conv1d_gdn``) stay
+              active. Entering ``jax.disable_jit()`` here would suppress those
+              nested jits and leak ``BufferedRef<vmem>`` through
+              ``lax.fori_loop`` (``Ref<vmem>[2,4,1,1,1280]``).
+            - native flax_nnx path: ``self.model_fn`` is the jitted
+              ``run_model``; the step runs under ``jax.disable_jit()`` which
+              demotes it to the eager impl, so host-orchestrated MoE expert
+              banks (``bank.route`` over ``jax.device_get``-materialized
+              arrays, layers/vllm/interface/moe.py:174) see concrete values —
+              a Jit tracer would raise ``TracerArrayConversionError``.
+            - non-eager: ``nullcontext()``; the jitted step runs unchanged.
+        """
         self.persistent_batch_manager.update_states(
             scheduler_output, self.get_mrope_input_positions_fn)
         if not scheduler_output.total_num_scheduled_tokens:
@@ -1711,14 +1749,41 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
-                # Eager mode (enforce_eager): run the step without jit so
-                # host-orchestrated MoE expert banks (host-side numpy routing +
-                # device_put slot refresh) work with concrete arrays. The jit
-                # trace cannot host-route (TracerArrayConversionError) and
-                # would freeze slot weights as trace-time constants.
+                # Eager mode (enforce_eager): run the step without an outer
+                # jit so host-orchestrated MoE expert banks (host-side numpy
+                # routing + device_put slot refresh) work with concrete
+                # arrays. The jit trace cannot host-route
+                # (TracerArrayConversionError) and would freeze slot weights
+                # as trace-time constants.
+                #
+                # Path-aware selection, NOT a blanket jax.disable_jit():
+                # - vLLM wrapper path: self.model_fn is already the un-jitted
+                # _eager_step from VllmModelWrapper.jit_step_func
+                # (models/vllm/vllm_model_wrapper.py:515); re-entering
+                # jax.disable_jit() would also suppress the *nested* @jax.jit
+                # Pallas kernels (GDN v3 fused_conv1d_gdn) and leak
+                # BufferedRef<vmem> through lax.fori_loop
+                # (Ref<vmem>[2,4,1,1,1280]). Call the un-jitted step bare.
+                # - native flax_nnx path: self.model_fn is the jitted
+                # run_model; only jax.disable_jit() demotes it to the eager
+                # impl (keeps bank.route at layers/vllm/interface/moe.py:174
+                # on concrete arrays).
                 eager = getattr(
                     self.model_config, "enforce_eager", False)
-                step_ctx = (jax.disable_jit() if eager else nullcontext())
+                if eager:
+                    # Lazy import mirrors models/common/model_loader.py:599 —
+                    # keeps the native path free of the torchax/vLLM-model
+                    # import graph. self.model is the VllmModelWrapper on the
+                    # vLLM branch (model_loader.py:641) and the jitted
+                    # run_model on the native branch (model_loader.py:586);
+                    # any other type conservatively keeps today's behavior.
+                    from tpu_inference.models.vllm.vllm_model_wrapper import (
+                        VllmModelWrapper)
+                    step_ctx = (nullcontext()
+                                if isinstance(self.model, VllmModelWrapper)
+                                else jax.disable_jit())
+                else:
+                    step_ctx = nullcontext()
                 with step_ctx:
                     (self.kv_caches, hidden_states, aux_hidden_states,
                      expert_indices) = self.model_fn(

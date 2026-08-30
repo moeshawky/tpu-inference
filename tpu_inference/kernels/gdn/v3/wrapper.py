@@ -33,12 +33,12 @@ def inner_kernel(
     # Outputs.
     out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
     # Scratches.
+    metadata_ref: memory_ref.MetadataRef,
+    weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
-    metadata_ref: memory_ref.MetadataRef,
-    weights_ref: memory_ref.WeightRefs,
 ):
     """Orchestrates computation of Conv1D and GDN for a single tile.
 
@@ -184,7 +184,6 @@ def outer_kernel(
     conv_state_ref: jax.Array,
     recurrent_state_ref: jax.Array,
     _: jax.Array,
-    host_num_tiles_ref: jax.Array,
     weights_ref: memory_ref.WeightRefs,
     # Outputs.
     out_ref: jax.Array,
@@ -211,14 +210,12 @@ def outer_kernel(
             cfg=cfg,
         ))
 
-    num_tiles = host_num_tiles_ref[...]
+    num_tiles = metadata_ref.num_tiles[...]
 
     pipeline_func = pltpu.emit_pipeline(
         body=functools.partial(
             inner_kernel,
             cfg=cfg,
-            metadata_ref=metadata_ref,
-            weights_ref=weights_ref,
         ),
         grid=(num_tiles, ),
         in_specs=(
@@ -248,6 +245,8 @@ def outer_kernel(
             recurrent_state_ref,
             out_ref,
             scratches=(
+                metadata_ref,
+                weights_ref,
                 carry_conv_scratch_ref,
                 carry_recurrent_scratch_ref,
             ),
@@ -500,11 +499,6 @@ def fused_conv1d_gdn(
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
 
-        # Host scalar for pipeline grid as explicit SMEM input — avoids
-        # captured constant [i32[]] and SMEM Ref<vmem> leak via lax.fori_loop.
-        host_num_tiles = metadata_obj.num_tiles
-        host_num_tiles_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
-
         # Step 7: Handle case where write needs to be done in existing out.
         in_out_spec = None
         input_output_aliases = {
@@ -531,7 +525,6 @@ def fused_conv1d_gdn(
                 hbm_spec,
                 hbm_spec,
                 in_out_spec,
-                host_num_tiles_spec,
                 weights_spec,
             ),
             out_specs=(hbm_spec, hbm_spec, hbm_spec),
@@ -551,7 +544,6 @@ def fused_conv1d_gdn(
             in_conv_state,
             in_recurrent_state,
             in_act,
-            host_num_tiles,
             weights,
         )
 

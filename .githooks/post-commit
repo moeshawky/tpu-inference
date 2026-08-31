@@ -1,0 +1,51 @@
+#!/bin/sh
+# CodeGraph Ferrari post-commit hook.
+# The hook is deliberately non-blocking: it starts one safe sync attempt and
+# never turns a successful Git commit into a failed commit.
+
+set -u
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+CODEGRAPH_DIR="$REPO_ROOT/.codegraph"
+[ -d "$CODEGRAPH_DIR" ] || exit 0
+
+LOG_FILE="$CODEGRAPH_DIR/hooks.log"
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
+}
+
+# If init found a pre-existing hook, it is preserved at this configured path
+# and chained before CodeGraph. Its failure is logged but cannot reject the
+# already-created commit.
+ORIGINAL_HOOK=$(git config --local --get codegraph.originalPostCommit 2>/dev/null || true)
+if [ -n "$ORIGINAL_HOOK" ] && [ -x "$ORIGINAL_HOOK" ] && [ "$ORIGINAL_HOOK" != "$0" ]; then
+    "$ORIGINAL_HOOK" "$@" >> "$LOG_FILE" 2>&1 || log "original post-commit hook failed"
+fi
+
+# Prefer the interpreter recorded by `codegraph init`, which lets a hook in a
+# watched sibling repo invoke the CodeGraph package from the central venv.
+# Fall back to the repository environment, then uv for fresh checkouts.
+HOOK_PYTHON=$(git config --local --get codegraph.hookPython 2>/dev/null || true)
+COMMIT_SHA=$(git rev-parse HEAD 2>/dev/null) || exit 0
+log "starting immediate sync for commit $COMMIT_SHA"
+
+# Detach from Git's hook process. The Python runner acquires the canonical
+# per-repo pipeline lock; if another run owns it, this attempt exits safely and
+# the polling/startup reconciliation path remains the recovery mechanism.
+if [ -n "$HOOK_PYTHON" ] && [ -x "$HOOK_PYTHON" ]; then
+    nohup "$HOOK_PYTHON" -m codegraph_ferrari.post_commit \
+        --repo "$REPO_ROOT" --revision "$COMMIT_SHA" \
+        >> "$LOG_FILE" 2>&1 </dev/null &
+elif [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    nohup "$REPO_ROOT/.venv/bin/python" -m codegraph_ferrari.post_commit \
+        --repo "$REPO_ROOT" --revision "$COMMIT_SHA" \
+        >> "$LOG_FILE" 2>&1 </dev/null &
+elif command -v uv >/dev/null 2>&1; then
+    nohup uv run --project "$REPO_ROOT" python -m codegraph_ferrari.post_commit \
+        --repo "$REPO_ROOT" --revision "$COMMIT_SHA" \
+        >> "$LOG_FILE" 2>&1 </dev/null &
+else
+    log "post-commit sync skipped: neither repository Python nor uv is available"
+fi
+
+exit 0

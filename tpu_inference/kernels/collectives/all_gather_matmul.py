@@ -582,7 +582,7 @@ def validate_inputs(x, y, tp_size, rhs_transpose=False):
 
     if m % (tp_size * 2) != 0:
         raise ValueError(
-            f"x.shape[0] ({m}) must be divisible by tp_size * 2 ({tp_size * 2})'."
+            f"x.shape[0] ({m}) must be divisible by tp_size * 2 ({tp_size * 2})."
         )
     if n % tp_size != 0:
         raise ValueError(

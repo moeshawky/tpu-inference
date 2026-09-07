@@ -76,7 +76,7 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                 if self.expert_dtype == "fp4":
                     if self.moe_quant_algo == "NVFP4":
                         # TODO: support NVFP4.
-                        return NotImplementedError(
+                        raise NotImplementedError(
                             "NVFP4 is not supported yet.")
 
                     moe_config = self.get_moe_config(layer)

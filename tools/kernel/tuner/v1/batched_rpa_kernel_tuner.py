@@ -354,4 +354,4 @@ class BatchedRpaKernelTuner(KernelTunerBase):
             logger.critical(
                 f"Unknown exception happened for {tuning_key}, {tunable_params}, {iters=} got error: {err=}"
             )
-            return TuningStatus.UNKNOWN_ERROR, float("inf"), float("inf")
+            raise

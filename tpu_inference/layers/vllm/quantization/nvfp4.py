@@ -44,9 +44,15 @@ from vllm.model_executor.layers.quantization import (
 from vllm.model_executor.layers.quantization.base_config import \
     QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import (
-    ACT, WEIGHT, CkptCtx, KNvfp4Dynamic, KNvfp4Static, ModelOptNvFp4Config,
-    ModelOptNvFp4FusedMoE, Shapes)
+    ModelOptNvFp4Config, ModelOptNvFp4FusedMoE)
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.parameter import (
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
+from vllm.model_executor.layers.fusion.quant_activation import (
+    expose_input_quant_key,
+)
 
 import tpu_inference.envs as envs
 from tpu_inference.layers.common.linear import sharded_quantized_matmul
@@ -116,7 +122,8 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
 class VllmNvfp4LinearMethod(VllmUnquantizedLinearMethod):
     """NVFP4 linear for TPU.
 
-    Reuses upstream KNvfp4Static and KNvfp4Dynamic for parameter registration.
+    Creates NVFP4 weight parameters using the stock ModelOpt API
+    (ModelWeightParameter, PerTensorScaleParameter).
     process_weights_after_loading unpacks FP4 and computes block scales.
     apply routes to vllm_linear_apply for OTF dequantization.
     """
@@ -130,19 +137,67 @@ class VllmNvfp4LinearMethod(VllmUnquantizedLinearMethod):
                        output_partition_sizes, input_size, output_size,
                        params_dtype, **extra_weight_attrs):
         del input_size, output_size
+        if not self.quant_config.is_checkpoint_nvfp4_serialized:
+            raise ValueError(
+                "NVFP4 quantization was selected, "
+                " dynamic quantization is not supported.")
+        output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = sum(output_partition_sizes)
+        layer.output_size_per_partition = output_size_per_partition
         layer.output_partition_sizes = output_partition_sizes
-        shapes = Shapes(output_partition_sizes, input_size_per_partition,
-                        params_dtype)
-        group_size = getattr(self.quant_config, "group_size", 16)
-        ctx = CkptCtx(group_size=group_size)
 
-        KNvfp4Static().create_weights(layer, WEIGHT, ctx, shapes,
-                                      weight_loader)
-        KNvfp4Dynamic().create_weights(layer, ACT, ctx, shapes, weight_loader)
+        if input_size_per_partition % 16 != 0:
+            raise ValueError(
+                "Unsupported model when in features size is not multiple of 16")
+
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_nvfp4_serialized
+            else params_dtype)
+
+        # Weight (packed uint8 NVFP4)
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                layer.output_size_per_partition,
+                layer.input_size_per_partition // 2,
+                dtype=torch.uint8,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        # Input Global Scale
+        input_global_scale = PerTensorScaleParameter(
+            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("input_scale", input_global_scale)
+
+        # Weight Global Scale
+        weight_global_scale = PerTensorScaleParameter(
+            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale_2", weight_global_scale)
+
+        # Per Block Weight Scale
+        weight_scale = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // self.quant_config.group_size,
+                dtype=weight_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+        expose_input_quant_key(layer, None)
 
         def scalar_weight_loader(param, loaded_weight, *args, **kwargs):
             assert loaded_weight.numel() == 1

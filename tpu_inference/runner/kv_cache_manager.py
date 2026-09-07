@@ -30,6 +30,8 @@ from vllm.models.deepseek_v4.attention import (DeepseekV4Attention,
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.backends.utils import (get_kv_cache_layout,
+                                              set_kv_cache_layout)
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)
@@ -757,6 +759,7 @@ class KVCacheManager:
 
         # set the kv cache layout which is needed by kv connectors
         # NOTE(jcgu): please update the default value when the order changes
+        set_kv_cache_layout(DEFAULT_KV_CACHE_LAYOUT)
         # verify kv cache layout is matched between the cache manager and
         # the kv connector (if configured)
         _required_kv_layout = get_kv_connector_cache_layout()

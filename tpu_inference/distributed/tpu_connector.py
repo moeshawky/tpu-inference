@@ -838,6 +838,7 @@ class TPUConnectorWorker:
         kv_size_mb = sum(k.nbytes for k in kv) / (1024 * 1024)
         end_time_0, end_time_1 = time.perf_counter(), None
         prepare_time_ms = (end_time_0 - start_time) * 1000
+        pull_time_ms = 0.0
         if dist_utils.get_enable_block_kv_transfer():
             while True:
                 end_time_1 = time.perf_counter()

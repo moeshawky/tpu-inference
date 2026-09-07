@@ -226,6 +226,7 @@ def paged_attention_with_guarded_smem(
                                       page_indices)
 
     mini_batch_size = MAX_ALLOWED_PAGE_INDICES_N // blocks_per_seq
+    mini_batch_size = max(1, mini_batch_size)
 
     # If batch_size is not disible by mini_batch_size,
     # we set mini_batch_size to a smaller value, i.e GCD,

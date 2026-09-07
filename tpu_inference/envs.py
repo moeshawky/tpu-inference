@@ -205,7 +205,6 @@ def env_str_list(env_name: str) -> Callable[[], list[str]]:
 
     Args:
         env_name: Name of the environment variable
-        default: Default list of strings if not set
     """
 
     def _get_str_list_env() -> list[str]:
@@ -220,11 +219,10 @@ def env_str_list(env_name: str) -> Callable[[], list[str]]:
 
 def env_int_list(env_name: str) -> Callable[[], list[int]]:
     """
-    Accepts a comma-separated string and returns a list of strings.
+    Accepts a comma-separated string and returns a list of integers.
 
     Args:
         env_name: Name of the environment variable
-        default: Default list of strings if not set
     """
 
     def _get_int_list_env() -> list[int]:

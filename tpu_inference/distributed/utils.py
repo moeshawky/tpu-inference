@@ -31,7 +31,7 @@ def set_node_kv_ip_port(ip_port: tuple[int, str, int]):
     _NODES_KV_IP_PORT[node_id] = (ip, port)
 
 
-def get_kv_ips() -> str:
+def get_kv_ips() -> list[str] | str:
     if envs.TPU_MULTIHOST_BACKEND == "ray":
         num_nodes = len(_NODES_KV_IP_PORT)
         ips = []
@@ -42,7 +42,7 @@ def get_kv_ips() -> str:
         return get_host_ip()
 
 
-def get_kv_ports() -> str:
+def get_kv_ports() -> list[int] | str:
     if envs.TPU_MULTIHOST_BACKEND == "ray":
         num_nodes = len(_NODES_KV_IP_PORT)
         ports = []
@@ -68,7 +68,7 @@ def get_side_channel_port() -> str:
     return port
 
 
-def get_transfer_channel_number() -> str:
+def get_transfer_channel_number() -> int:
     n = os.getenv("TPU_KV_TRANSFER_CHANNEL_NUMBER", "8")
     return int(n)
 

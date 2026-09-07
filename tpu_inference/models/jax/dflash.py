@@ -39,9 +39,6 @@ logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
 
-# vmem budget for the flash_attention Pallas kernel (128 MiB).
-_FA_VMEM_LIMIT = 128 * 1024 * 1024
-
 
 class DFlashAttention(nnx.Module):
     """DFlash cross+self attention with on-device KV cache.

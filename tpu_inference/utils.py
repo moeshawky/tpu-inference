@@ -203,6 +203,11 @@ def get_device_hbm_limit() -> int:
 
 
 def pathways_hbm_usage_gb(devices: Any) -> List[Tuple[float, float]]:
+    """Returns HBM usage in raw bytes (NOT GiB).
+
+    Despite the `_gb` suffix in the name, values are returned as bytes
+    (nbytes). Callers may rely on the function name; renaming is out of scope.
+    """
     live_arrays = jax.live_arrays()
     hbm_used = defaultdict(int)
     hbm_limit = get_device_hbm_limit()

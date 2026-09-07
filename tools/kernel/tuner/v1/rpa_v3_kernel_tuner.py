@@ -454,4 +454,4 @@ class RpaV3KernelTuner(KernelTunerBase):
             )
             raise Exception(
                 f"Kernel run failed with tuning key & tunable params:\nTuningKey=\n{tuning_key}, TunableParams=\n{tunable_params}, got error: {err=}"
-            )
+           ) from err

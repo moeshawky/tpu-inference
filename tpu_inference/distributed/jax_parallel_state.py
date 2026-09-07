@@ -18,13 +18,13 @@ import jax
 from jax.experimental import transfer
 
 BASE_JAX_PORT = 5000
-
+_PP = None
 
 class GroupCoordinator:
     """
     Jax ProcessGroup wrapper for a group of Pipeline Parallel processes.
-    This is a simplfied version which aligns the APIs with pytorch's
-        GroupdCoordinator in vllm/distributed/parallel_state.py.
+    This is a simplified version which aligns the APIs with pytorch's
+        GroupCoordinator in vllm/distributed/parallel_state.py.
     GroupCoordinator takes charge of the communication operations among
         the processes in the group. Currently the communication is
         send/recv intermediate tensor (tensor_dict) between consecutive PP

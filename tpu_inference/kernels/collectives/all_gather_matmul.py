@@ -578,7 +578,7 @@ def validate_inputs(x, y, tp_size, rhs_transpose=False):
 
     m_per_device_per_direction = m // tp_size // 2
     if m_per_device_per_direction % 8 != 0:
-        raise ValueError(f"m ({m}) must be divisible by {{tp_size * 2 * 8}}.")
+        raise ValueError(f"m ({m}) must be divisible by {tp_size * 2 * 8}.")
 
     if m % (tp_size * 2) != 0:
         raise ValueError(

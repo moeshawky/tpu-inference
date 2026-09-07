@@ -4,7 +4,7 @@
 Proxy server routes the request to P with max_output_tokens=1
 
 P workflow:
-    P recives the request
+    P receives the request
 
     P scheduler checks if the prefill is full done in `request_finished()`
     If done:
@@ -28,10 +28,10 @@ P workflow:
         The waiting buffer will get freed after notified by D or expired.
     )
 
-Proxy server recives the response from P and forwards it to D
+Proxy server receives the response from P and forwards it to D
 
 D workflow:
-    D recives the request
+    D receives the request
 
     D scheduler calculates the num of tokens needing to pull from P in `get_num_new_matched_tokens()`
     D checks if need to pull from P
@@ -613,11 +613,11 @@ class TPUConnectorWorker:
                     self.kv_pull_uuid_to_req_id_map.pop(uuid)
                 else:
                     logger.warning(
-                        f"TPUConnector Worker {self.node_id} --> Disagg producer recives a non-exist pulling finished notification request {req_id} | uuid {uuid}"
+                        f"TPUConnector Worker {self.node_id} --> Disagg producer receives a non-exist pulling finished notification request {req_id} | uuid {uuid}"
                     )
             else:
                 logger.warning(
-                    f"TPUConnector Worker {self.node_id} --> Disagg producer recives a non-exist pulling finished notification uuid {uuid}"
+                    f"TPUConnector Worker {self.node_id} --> Disagg producer receives a non-exist pulling finished notification uuid {uuid}"
                 )
             time.sleep(0)
             # The response is not really needed.
@@ -680,6 +680,9 @@ class TPUConnectorWorker:
                     logger.info(
                         f"TPUConnector Worker {self.node_id} --> req_id={req_id}, skip insert_kv_chunks."
                     )
+                    # The request has full local prefix cache, need to notify P to let it free blocks.
+                    socket = self._maybe_build_notif_socket(req_meta)
+                    self._notify_pull_done(socket, req_id, req_meta.uuid)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """
@@ -913,7 +916,7 @@ class TPUConnectorWorker:
         if not self.reqs_wait_pull and not self.reqs_pulling:
             return done_sending, done_recving
 
-        # Mark a req as done recieving after its pulling thread returns.
+        # Mark a req as done receiving after its pulling thread returns.
         # This req can then be scheduled for decoding in the next scheduler step.
         for req_id in list(self.reqs_pulling.keys()):
             if self.reqs_pulling[req_id][1] is None:
@@ -923,7 +926,7 @@ class TPUConnectorWorker:
                     self.reqs_pulling[req_id][1] = kv
                     done_recving.add(req_id)
 
-        # Mark a req as done seding when it's expired.
+        # Mark a req as done seeding when it's expired.
         # This req can then be released blocks in the current scheduler step.
         now = time.perf_counter()
         for req_id in list(self.reqs_wait_pull):
@@ -951,7 +954,7 @@ class TPUConnectorWorker:
 def get_uuid() -> int:
     int128 = uuid4().int
     # Must be less than 64-bit int, otherwise vllm output encoder would raise error.
-    # use 50 bit to avoid GO trunk the int when doing JSon serialization
+    # use 50 bit to avoid GO trunk the int when doing JSON serialization
     return int128 >> 78
 
 

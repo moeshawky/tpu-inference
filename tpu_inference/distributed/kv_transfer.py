@@ -116,8 +116,6 @@ def _wait_async_copy_kernel(
     """Internal kernel for waiting for async copy."""
     dest_ref_in = args[0]
     semaphore_ref = args[1]
-    dest_ref_out = args[2]
-    del dest_ref_out
 
     @pl.loop(0, num_chunks[0])
     def wait_copy(i):

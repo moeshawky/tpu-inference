@@ -446,6 +446,7 @@ def expert_parallel_gmm(
     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
     num_experts = w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
+    assert num_experts % ep_size == 0
     group_offset = jnp.arange(0, num_experts, num_experts_per_shard)
 
     w1_scale_spec = None if w1_scale is None else ep_p_spec

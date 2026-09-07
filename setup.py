@@ -73,8 +73,7 @@ setup(
     name="tpu_inference",
     version=get_version(),
     description="",
-    long_description=open("README.md").read() if hasattr(
-        open("README.md"), "read") else "",
+    long_description=open("README.md").read() if os.path.isfile("README.md") else "",
     long_description_content_type="text/markdown",
     author="tpu_inference Contributors",
     packages=find_packages(),

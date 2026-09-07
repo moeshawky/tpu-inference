@@ -38,9 +38,8 @@ def xla_quantized_matmul(
     Args:
         x:  Activation.
         w_q: Weight quantized array. [n_input_features, n_output_features]
-        w_s: Weight quantization scale. [n_output_features]
-        mesh: Mesh to shard on.
-        weight_sharding: PartitionSpec for the weight tensor.
+        w_scale: Weight quantization scale. [n_output_features]
+        quantize_activation: Whether to quantize the activation. Defaults to True.
 
     Returns:
         Output of the quantized matmul.

@@ -16,6 +16,7 @@ import glob
 import hashlib
 import os
 import shutil
+import shlex
 import subprocess
 from typing import List, Optional
 
@@ -36,7 +37,7 @@ LOCK_DIR = "/tmp/lock"
 
 
 def run_cmd(cmd: str, *args, **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd.split(), *args, **kwargs)
+    return subprocess.run(shlex.split(cmd), *args, **kwargs)
 
 
 def delete_file(path: str) -> None:

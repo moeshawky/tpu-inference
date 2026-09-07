@@ -27,12 +27,21 @@ logger = logging.getLogger(__name__)
 
 
 def _get_val(obj: Any, key: str, default: Any = None) -> Any:
-    """Helper to extract an attribute or dict key seamlessly from any duck-typed request."""
+    """Helper to extract an attribute or dict key seamlessly from any duck-typed request.
+
+    Falls back to `default` both when `key` is absent and when it's present
+    but explicitly `None` -- request dataclasses across callers (e.g. tunix's
+    rollout requests) commonly default optional sampling fields to `None`
+    rather than omitting them, and vLLM's `SamplingParams` rejects `None` for
+    fields like `top_k` that it compares numerically.
+    """
     if obj is None:
         return default
     if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
+        val = obj.get(key, default)
+    else:
+        val = getattr(obj, key, default)
+    return default if val is None else val
 
 
 class RLVllmSampler:
@@ -85,17 +94,6 @@ class RLVllmSampler:
         self._engine = AsyncLLMEngine.from_engine_args(self.engine_args)
         self._is_running = True
 
-        init_info = {
-            "model_path": self.engine_args.model,
-            "tp_size": self.engine_args.tensor_parallel_size,
-        }
-        if self._engine:
-            try:
-                await self._engine.init_weight_transfer_engine(init_info)
-            except Exception as e:
-                logger.warning(
-                    "Failed to initialize weight transfer engine: %s", e)
-
         logger.info("RLVllmSampler started successfully.")
 
     async def stop(self, **kwargs: Any) -> None:
@@ -145,13 +143,16 @@ class RLVllmSampler:
     ) -> VllmSamplingParams:
         """Builds a vLLM SamplingParams object from any duck-typed request."""
         sparams = _get_val(req, "sampling_params")
+        # `kwargs` goes through `_get_val` too: callers pass unset fields as
+        # explicit `None`, so `.get(key, default)` returns `None` rather than
+        # the default, defeating it before `_get_val` can coalesce.
         return VllmSamplingParams(
             temperature=_get_val(sparams, "temperature",
-                                 kwargs.get("temperature", 0.7)),
-            top_p=_get_val(sparams, "top_p", kwargs.get("top_p", 0.95)),
-            top_k=_get_val(sparams, "top_k", kwargs.get("top_k", -1)),
+                                 _get_val(kwargs, "temperature", 0.7)),
+            top_p=_get_val(sparams, "top_p", _get_val(kwargs, "top_p", 0.95)),
+            top_k=_get_val(sparams, "top_k", _get_val(kwargs, "top_k", -1)),
             max_tokens=_get_val(sparams, "max_tokens",
-                                kwargs.get("max_tokens", 128)),
+                                _get_val(kwargs, "max_tokens", 128)),
             stop=_get_val(sparams, "stop_sequences")
             or _get_val(sparams, "stop") or kwargs.get("stop"),
             logprobs=1
@@ -175,6 +176,12 @@ class RLVllmSampler:
                 text = output_choice.text
                 token_ids_arr = np.array(output_choice.token_ids,
                                          dtype=np.int32)
+                # On the RequestOutput, not the CompletionOutput. Tunix feeds
+                # this into np.asarray(..., dtype=np.int32), so omitting it
+                # surfaces as "int() argument must be ... not 'NoneType'".
+                prompt_token_ids_arr = np.array(
+                    getattr(final_output, "prompt_token_ids", None) or [],
+                    dtype=np.int32)
                 cum_logprob = float(
                     getattr(output_choice, "cumulative_logprob", 0.0) or 0.0)
 
@@ -196,6 +203,7 @@ class RLVllmSampler:
                     request_id=req_id,
                     text=text,
                     token_ids=token_ids_arr,
+                    prompt_token_ids=prompt_token_ids_arr,
                     logprobs=logprobs_arr,
                     cumulative_logprob=cum_logprob,
                     routed_experts=routed_experts,
@@ -213,6 +221,7 @@ class RLVllmSampler:
                 request_id=req_id,
                 text="",
                 token_ids=np.zeros(0, dtype=np.int32),
+                prompt_token_ids=np.zeros(0, dtype=np.int32),
                 logprobs=None,
                 cumulative_logprob=0.0,
                 routed_experts=None,
@@ -231,6 +240,7 @@ class RLVllmSampler:
                 request_id=req_id,
                 text="",
                 token_ids=np.zeros(0, dtype=np.int32),
+                prompt_token_ids=np.zeros(0, dtype=np.int32),
                 logprobs=None,
                 cumulative_logprob=0.0,
                 routed_experts=None,
@@ -340,17 +350,66 @@ class RLVllmSampler:
             "tpu_worker_ips": worker_ips,
         }
 
+    async def _call_worker_method(self, method_name: str, *args: Any,
+                                  **kwargs: Any) -> list[Any]:
+        """Dispatches a method call across TPU workers via collective_rpc.
+
+        `AsyncLLMEngine` (an alias of `vllm.v1.engine.async_llm.AsyncLLM`)
+        always exposes an async `collective_rpc`.
+        """
+        if self._engine is None:
+            return []
+        return await self._engine.collective_rpc(method_name,
+                                                 args=args,
+                                                 kwargs=kwargs)
+
+    async def get_weights_state(self) -> list[Any]:
+        """Returns the PyTree of weights or state from active TPU workers."""
+        return await self._call_worker_method("get_weights_state")
+
+    async def bind_raiden_sync(self,
+                               worker_index: int = 0,
+                               parallelism: int = 4) -> None:
+        """Binds Raiden to each TPU worker's live weights, in-process.
+
+        `get_weights_state()` cannot back a rollout-side weight sync: the
+        live `nnx.State` it returns has to be dispatched back across
+        `collective_rpc` into this (parent) process to be useful, but vLLM's
+        RPC transport can't serialize `nnx.State`/live TPU arrays, and even a
+        pickle-based fallback would bind Raiden to a disconnected host copy
+        rather than the device buffers actually being served. Binding must
+        happen in the worker subprocess instead -- see
+        `tpu_worker.TPUWorker.bind_raiden_sync`.
+        """
+        await self._call_worker_method("bind_raiden_sync", worker_index,
+                                       parallelism)
+
+    async def get_raiden_metadata(self) -> list[dict]:
+        """Wire-safe registration metadata for each worker's current Raiden binding."""
+        return await self._call_worker_method("get_raiden_metadata")
+
+    async def raiden_h2d(self) -> list[dict]:
+        """Blocks each worker until its just-landed transfer is visible on-device.
+
+        Returns each worker's checksums dict (empty unless VERIFY_WEIGHTS=true).
+        """
+        return await self._call_worker_method("raiden_h2d")
+
+    async def raiden_metrics(self) -> list[dict]:
+        return await self._call_worker_method("raiden_metrics")
+
     async def pre_weight_sync(
         self,
         sync_request: Any = None,
         free_kv_cache: bool = True,
         **kwargs: Any,
     ) -> None:
-        """Phase 1: Pauses intake, clears prefix cache, and calls start_weight_update()."""
+        """Phase 1: Pauses intake, clears prefix cache, and drops KV cache via delete_kv_cache()."""
         self._policy_version = _get_val(sync_request, "policy_version",
                                         self._policy_version)
-        logger.info("Executing pre_weight_sync (policy_version=%d)",
-                    self._policy_version)
+        logger.info(
+            "Executing pre_weight_sync (policy_version=%d, free_kv_cache=%s)",
+            self._policy_version, free_kv_cache)
 
         if sync_request is not None:
             rid = _get_val(sync_request, "req_id")
@@ -360,19 +419,21 @@ class RLVllmSampler:
         await self.pause()
         await self._clear_prefix_cache()
 
-        if self._engine and hasattr(self._engine, "start_weight_update"):
-            self._engine.start_weight_update(free_kv_cache=free_kv_cache)
+        # `AsyncLLMEngine.start_weight_update()` takes no arguments, so it
+        # can't forward `free_kv_cache` to the worker -- go through
+        # collective_rpc directly instead of the engine-level wrapper.
+        await self._call_worker_method("start_weight_update",
+                                       free_kv_cache=free_kv_cache)
 
     async def weight_sync(
         self,
         sync_request: Any = None,
         **kwargs: Any,
     ) -> None:
-        """Phase 2: Calls TPUWorker.update_weights(update_info)."""
+        """Phase 2: Coordinates weight synchronization barrier across TPU workers."""
         logger.info("Executing weight_sync update on TPU workers...")
         u_info = _get_val(sync_request, "extra_config") or {}
-        if self._engine:
-            self._engine.update_weights(u_info)
+        await self._call_worker_method("update_weights", u_info)
         await asyncio.sleep(0.01)
 
     async def post_weight_sync(
@@ -380,14 +441,13 @@ class RLVllmSampler:
         sync_request: Any = None,
         **kwargs: Any,
     ) -> None:
-        """Phase 3: Calls TPUWorker.finish_weight_update()."""
+        """Phase 3: Restores KV cache via reinitialize_kv_cache() and resumes serving."""
         rid = None
         if sync_request is not None:
             rid = _get_val(sync_request, "req_id")
         logger.info("Executing post_weight_sync (req_id=%s)...", rid)
 
-        if self._engine:
-            self._engine.finish_weight_update()
+        await self._call_worker_method("finish_weight_update")
 
         self._cache_valid = True
         if rid:

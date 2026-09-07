@@ -1685,7 +1685,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # request_distribution[0] tracks the number of decode requests.
         is_decode_only = self.input_batch.request_distribution[
             0] == self.input_batch.num_reqs
-        if is_decode_only and self.enable_continue_decode:
+        has_structured_output = getattr(scheduler_output,
+                                        "has_structured_output_requests",
+                                        False)
+        if (is_decode_only and self.enable_continue_decode
+                and not has_structured_output):
             return self._execute_continue_decode(scheduler_output)
 
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
@@ -2578,10 +2582,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         is_decode_only = (self.input_batch.request_distribution[0] ==
                           self.input_batch.num_reqs)
+        has_structured_output = getattr(scheduler_output,
+                                        "has_structured_output_requests",
+                                        False)
+        use_continue_decode = (is_decode_only and self.enable_continue_decode
+                               and not has_structured_output)
 
         padded_num_reqs_per_dp_rank = runner_utils.get_padded_token_len(
             self.num_reqs_paddings_per_dp, max_num_reqs_across_dp)
-        if is_decode_only and self.enable_continue_decode:
+        if use_continue_decode:
             padded_num_scheduled_tokens_per_dp_rank = padded_num_reqs_per_dp_rank
         else:
             padded_num_scheduled_tokens_per_dp_rank = runner_utils.get_padded_token_len(
@@ -2613,7 +2622,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             logits_indices_selector = all_positions[sorted_indices]
 
             tokens_indices_selector = None
-            if self.enable_continue_decode:
+            if use_continue_decode:
                 all_token_positions = np.concatenate([
                     np.arange(len(req_indices_dp[dp_rank])) +
                     padded_num_scheduled_tokens_per_dp_rank * dp_rank
@@ -3112,19 +3121,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         positions = self.positions_cpu[:padded_total_num_scheduled_tokens]
         mrope_positions = self.mrope_positions_cpu[:, :
                                                    padded_total_num_scheduled_tokens]
+        max_decode_tokens = self.input_batch.max_decode_tokens
+
         _request_distribution = []
         _mamba_request_distribution = []
         for dp_rank in range(dp_size):
             _num_reqs = num_req_per_dp_rank[dp_rank]
             # The batch has been reordered by _reorder_batch into
             # [decode][spec verify][prefill/mixed] segments. Count 1-token
-            # decode requests (the RPA decode segment) and windowed requests
+            # decode requests (the RPA decode segment, those with
+            # num_scheduled_tokens <= max_decode_tokens) and windowed requests
             # (decodes + speculative verify windows, the GDN windowed
             # segment) in this DP rank.
             num_decode_in_dp_rank = 0
             num_windowed_in_dp_rank = 0
             for req_id in req_ids_dp[dp_rank]:
-                if scheduler_output.num_scheduled_tokens[req_id] == 1:
+                if scheduler_output.num_scheduled_tokens[
+                        req_id] <= max_decode_tokens:
                     num_decode_in_dp_rank += 1
                     num_windowed_in_dp_rank += 1
                 elif req_id in scheduler_output.scheduled_spec_decode_tokens:
@@ -3311,7 +3324,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # pure-attention models, leaving the field None keeps AttentionMetadata
         # byte-identical to the pre-compact-mamba layout (so the model_fn
         # signature on those models is unchanged).
-        if self.kv_cache_config.has_mamba_layers:
+        # In align mode (prefix caching), mamba state indices are derived on-device
+        # from the block tables, so mamba_state_indices is None.
+        if (self.kv_cache_config.has_mamba_layers and getattr(
+                self.cache_config, "mamba_cache_mode", "none") != "align"):
             # Reorder mamba_state_indices per DP rank (like block_tables)
             # and convert global slot ids to rank-local indices so they
             # index correctly into the per-rank shard of the mamba state.

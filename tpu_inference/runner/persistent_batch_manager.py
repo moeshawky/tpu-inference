@@ -55,14 +55,31 @@ class PersistentBatchManager:
         swap_cnt = 0
         if num_reqs <= 0:
             return swap_cnt
-        # If total_num_scheduled_tokens == num_reqs, every request
-        # is scheduled for exactly 1 token (all decode). No reordering needed.
-        if scheduler_output.total_num_scheduled_tokens == num_reqs:
+        max_decode_tokens = self.input_batch.max_decode_tokens
+
+        if (max_decode_tokens == 1
+                and scheduler_output.total_num_scheduled_tokens == num_reqs):
             num_decode = num_reqs
             self.input_batch.request_distribution = [
                 num_decode, num_decode, num_reqs
             ]
             return swap_cnt
+        # Upstream fast-path: all requests within decode threshold (handles
+        # batched RPA where max_decode_tokens == num_spec + 1).
+        all_decode = True
+        for req_id in self.input_batch.req_ids[:num_reqs]:
+            if scheduler_output.num_scheduled_tokens[
+                    req_id] > max_decode_tokens:
+                all_decode = False
+                break
+
+        if all_decode:
+            num_decode = num_reqs
+            self.input_batch.request_distribution = [
+                num_decode, num_decode, num_reqs
+            ]
+            return swap_cnt
+
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
 
         def segment(req_id: str) -> int:
@@ -101,6 +118,10 @@ class PersistentBatchManager:
         if num_decode < num_reqs:
             num_windowed = partition(num_decode, num_reqs - 1, 1)
 
+        # NEEDS-EYES: request_distribution[1] same-key different-value —
+        # upstream generic set to num_decode (duplicated), ours distinct
+        # windowed for GDN mamba_request_distribution; keep ours (windowed)
+        # to match tpu_runner.py _mamba_request_distribution.
         self.input_batch.request_distribution = [
             num_decode, num_windowed, num_reqs
         ]

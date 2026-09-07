@@ -173,6 +173,7 @@ class RpaV3KernelTuner(KernelTunerBase):
                          lightweight=lightweight)
 
         self.max_model_len = 2048
+        self.max_num_tokens = self.max_model_len
         self.max_num_seqs = 128
         self.bkv_p_lst = [64, 128]
         self.bq_sz_lst = [128]
@@ -443,4 +444,14 @@ class RpaV3KernelTuner(KernelTunerBase):
             logger.info(
                 f"[Debug] Failed with ({page_size=}, {tunable_params.bkv_p=},"
                 f" {tunable_params.bq_sz=}), got error: {err=}")
-            return TuningStatus.UNKNOWN_ERROR, float("inf"), float("inf")
+            if "RESOURCE_EXHAUSTED:" in str(err):
+                logger.warning(
+                    f"Kernel run failed with OOM for {tuning_key=}, {tunable_params=}"
+                )
+                return TuningStatus.FAILED_OOM, float("inf"), float("inf")
+            logger.warning(
+                f"Failed with {tuning_key=}, {tunable_params=}, got error: {err=}"
+            )
+            raise Exception(
+                f"Kernel run failed with tuning key & tunable params:\nTuningKey=\n{tuning_key}, TunableParams=\n{tunable_params}, got error: {err=}"
+            )

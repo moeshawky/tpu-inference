@@ -153,5 +153,5 @@ class FlashAttentionKernelTuner(KernelTunerBase):
                 f"Kernel failed with block_q={tunable_params.block_q}, block_k_major={tunable_params.block_k_major}, block_k={tunable_params.block_k}, block_b={tunable_params.block_b}: {e}"
             )
             if "out of memory" in str(e).lower() or "vmem" in str(e).lower():
-                return TuningStatus.FAILED_OOM, 0.0, 0.0
-            return TuningStatus.UNKNOWN_ERROR, 0.0, 0.0
+                return TuningStatus.FAILED_OOM, float("inf"), float("inf")
+            raise

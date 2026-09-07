@@ -52,6 +52,7 @@ class TPUConnectorHMA(TPUConnector, SupportsHMA):
                  vllm_config: VllmConfig,
                  role: KVConnectorRole,
                  kv_cache_config: "KVCacheConfig | None" = None):
+        super().__init__(vllm_config, role, kv_cache_config)
         self._connector_metadata = None
 
         if role == KVConnectorRole.SCHEDULER:
@@ -529,7 +530,7 @@ def _select_from_kv_caches_per_group(
 ) -> list[jax.Array]:
     """Read blocks specified by `block_ids_per_group`.
 
-    Returns a flat list of arrays to be transfered. Mamaba 
+    Returns a flat list of arrays to be transfered. Mamba 
     layer kv cache is a tuple of arrays and will be flattened.
     """
     indices_per_group = [

@@ -112,7 +112,7 @@ class KernelAutoTuneResultProcessor:
                     query,
                     params={
                         'id': case_set_id,
-                        'rid': '0'
+                        'rid': '001'
                     },
                     param_types={
                         'id': gspanner.param_types.STRING,

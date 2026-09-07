@@ -322,4 +322,6 @@ class MlaKernelTuner(KernelTunerBase):
             logger.warning(
                 f"Failed with {tuning_key=}, {tunable_params=}, got error: {err=}"
             )
-            return TuningStatus.UNKNOWN_ERROR, float("inf"), float("inf")
+            raise Exception(
+                f"Kernel run failed with tuning key & tunable params:\nTuningKey=\n{tuning_key}, TunableParams=\n{tunable_params}, got error: {err=}"
+            )

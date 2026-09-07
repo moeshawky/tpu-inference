@@ -26,8 +26,25 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsConfig as VllmUpstreamCTConfig
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import \
     should_ignore_layer
-from vllm.model_executor.layers.quantization.utils.config_utils import \
-    is_equal_or_regex_match
+try:
+    # vllm-src >= 3006c97 moved the matcher out of config_utils into
+    # compressed_tensors.utils and renamed it (is_equal_or_regex_match
+    # -> check_equal_or_regex_match, single target -> target list).
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        check_equal_or_regex_match as _ct_check_match,
+    )
+
+    def _check_equal_or_regex_match(layer_name: str,
+                                    targets: Iterable[str]) -> bool:
+        return _ct_check_match(layer_name, targets)
+except ImportError:
+    from vllm.model_executor.layers.quantization.utils.config_utils import \
+        is_equal_or_regex_match
+
+    def _check_equal_or_regex_match(layer_name: str,
+                                    targets: Iterable[str]) -> bool:
+        return any(
+            is_equal_or_regex_match(layer_name, target) for target in targets)
 
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.linear import (JaxEinsum,
@@ -58,12 +75,6 @@ def _weight_block_size(weight_quant) -> Optional[list[int]]:
     """Return [block_n, block_k], or None if the weights are not block-quantized."""
     block = getattr(weight_quant, "block_structure", None)
     return list(block) if block is not None else None
-
-
-def _check_equal_or_regex_match(layer_name: str,
-                                targets: Iterable[str]) -> bool:
-    return any(
-        is_equal_or_regex_match(layer_name, target) for target in targets)
 
 
 class CompressedTensorsConfig(QuantizationConfig):

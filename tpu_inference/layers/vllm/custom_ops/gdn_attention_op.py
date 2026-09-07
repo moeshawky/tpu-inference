@@ -146,7 +146,11 @@ def gdn_attention_core_tpu(
     #     requests into lower-index slots after earlier ones finish), the
     #     slot id moves with the request so the kernel still reads/writes
     #     the slot that holds this request's real state.
-    state_indices = state_indices.astype(jnp.int32)
+    state_indices = (
+        state_indices.astype(jnp.int32)
+        if state_indices is not None
+        else None
+    )
     padded_num_reqs_per_dp = padded_num_reqs // dp_size
 
     query_start_loc_sliced = truncate_sharded_tensor(
@@ -155,7 +159,7 @@ def gdn_attention_core_tpu(
                                               dp_size)
 
     cache_config = vllm_context.vllm_config.cache_config
-    if cache_config.mamba_cache_mode == "align":
+    if cache_config.mamba_cache_mode == "align" or state_indices is None:
         # Mamba prefix caching ("align" mode): derive read/write state slots
         # from the mamba block table directly on TPU.
         block_tables = block_tables.reshape(seq_lens.shape[0], -1)
@@ -193,11 +197,35 @@ def gdn_attention_core_tpu(
         #     requests into lower-index slots after earlier ones finish), the
         #     slot id moves with the request so the kernel still reads/writes
         #     the slot that holds this request's real state.
-        state_indices = attn_metadata.mamba_state_indices.astype(jnp.int32)
-        state_indices_sliced = truncate_sharded_tensor(state_indices,
-                                                       padded_num_reqs_per_dp,
-                                                       dp_size)
-        read_state_indices_sliced = state_indices_sliced
+        state_indices = attn_metadata.mamba_state_indices
+        if state_indices is not None:
+            state_indices = state_indices.astype(jnp.int32)
+            state_indices_sliced = truncate_sharded_tensor(state_indices,
+                                                           padded_num_reqs_per_dp,
+                                                           dp_size)
+            read_state_indices_sliced = state_indices_sliced
+        else:
+            # Fallback for None (pure-attention warmup or align): derive
+            # from block_tables as in the align branch above.
+            block_tables = block_tables.reshape(seq_lens.shape[0], -1)
+            max_num_reqs_per_dp = seq_lens.shape[0] // dp_size
+            block_tables_reshaped = block_tables.reshape(dp_size,
+                                                         max_num_reqs_per_dp, -1)
+            block_tables_sliced = block_tables_reshaped[:, :
+                                                        padded_num_reqs_per_dp, :].reshape(
+                                                            -1,
+                                                            block_tables.shape[-1])
+            mamba_block_size = cache_config.mamba_block_size
+            query_start_loc_reshaped = query_start_loc_sliced.reshape(
+                dp_size, padded_num_reqs_per_dp + 1)
+            query_lens = (query_start_loc_reshaped[:, 1:] -
+                          query_start_loc_reshaped[:, :-1]).reshape(-1)
+            num_computed = seq_lens_sliced - query_lens
+            read_col = jnp.maximum(num_computed - 1, 0) // mamba_block_size
+            write_col = jnp.maximum(seq_lens_sliced - 1, 0) // mamba_block_size
+            batch_idx = jnp.arange(seq_lens_sliced.shape[0])
+            read_state_indices_sliced = block_tables_sliced[batch_idx, read_col]
+            state_indices_sliced = block_tables_sliced[batch_idx, write_col]
 
     (new_conv_state_extracted,
      new_recurrent_state), j_output = run_jax_gdn_attention(

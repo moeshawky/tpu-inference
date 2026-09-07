@@ -313,7 +313,7 @@ def multi_layer_copy(
   The source and destination arrays are sliced into "chunks" or "blocks".
   The specific offsets of blocks to copy are provided dynamically via
   `src_offsets` and `dest_offsets`. The slicing logic (which dimension to
-  chunk on, block size, etc.) is encapsulated in the `copy_f` parameter.
+  chunk on, block size, etc.) are determined by `src_offsets`, `dest_offsets`, and `chunk_sizes`.
 
   Requirements:
     - `src_array` must be sharded across the TPU memory.
@@ -412,7 +412,7 @@ def _get_copy_to_dest_fn(mesh, sharding_spec, out_sharding, dtype,
 
 
 def copy_to_host(src, dest, mesh, sharding_spec):
-    """"Copies from src to dest."""
+    """Copies from src to dest."""
 
     out_sharding = dest.sharding
     dtype = dest.dtype

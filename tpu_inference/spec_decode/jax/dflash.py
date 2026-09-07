@@ -169,7 +169,7 @@ class DFlashProposer:
                     else:
                         logger.warning(
                             "Draft and target models DO NOT share embedding.")
-                except Exception:
+                except RuntimeError:
                     logger.info(
                         "Directly setting draft model embedding to target embedding."
                     )
@@ -199,7 +199,7 @@ class DFlashProposer:
                         logger.warning(
                             f"Shape mismatch: draft {draft_lm_head_param.value.shape} vs target {target_lm_head_value.shape}."
                         )
-                except Exception:
+                except RuntimeError:
                     logger.info(
                         "Directly setting draft model lm_head to target lm_head."
                     )

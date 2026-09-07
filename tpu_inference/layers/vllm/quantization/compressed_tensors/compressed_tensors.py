@@ -128,7 +128,7 @@ class VllmCompressedTensorsConfig(CompressedTensorsConfig, VllmQuantConfig):
                     linear_config=linear_config,
                 )
             raise ValueError(
-                "For NVFP4 weights, input quantization must be NVFP4, FP8 or ",
+                "For NVFP4 weights, input quantization must be NVFP4, FP8 or "
                 "None for NVFP4A16",
             )
 

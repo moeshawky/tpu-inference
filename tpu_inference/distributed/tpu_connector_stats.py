@@ -116,7 +116,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             "Num successful transfers":
             self.num_successful_transfers,
             "Num failed transfers":
-            self.data['num_failed_transfers'],
+            len(self.data['num_failed_transfers']),
             "Avg KV transfer prepare time (ms)":
             round(prepare_time.mean(), 3) if prepare_time.size > 0 else 0.0,
             "P90 KV transfer prepare time (ms)":

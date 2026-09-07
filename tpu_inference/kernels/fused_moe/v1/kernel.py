@@ -1364,7 +1364,7 @@ def fused_ep_moe(
                 f"Expected {subc_quant_w1_sz=} to be non-negative.")
         if subc_quant_w1_sz % 256 != 0:
             raise ValueError(
-                "Expected {subc_quant_w1_sz=} to be aligned to 256.")
+                f"Expected {subc_quant_w1_sz=} to be aligned to 256.")
         if hidden_size % subc_quant_w1_sz != 0:
             raise ValueError(
                 f"Expected {hidden_size=} to be aligned to {subc_quant_w1_sz=}."
@@ -1381,7 +1381,7 @@ def fused_ep_moe(
                 f"Expected {subc_quant_w2_sz=} to be non-negative.")
         if subc_quant_w2_sz % 256 != 0:
             raise ValueError(
-                "Expected {subc_quant_w2_sz=} to be aligned to 256.")
+                f"Expected {subc_quant_w2_sz=} to be aligned to 256.")
         if intermediate_size % subc_quant_w2_sz != 0:
             raise ValueError(
                 f"Expected {intermediate_size=} to be aligned to {subc_quant_w2_sz=}."

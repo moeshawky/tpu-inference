@@ -62,6 +62,11 @@ logger = init_logger(__name__)
 # N=num_blocks, H=num_heads and D=head_size
 DEFAULT_KV_CACHE_LAYOUT = "NHD"
 
+# Default multiplier for Mamba prefix cache checkpoint budget.
+# Sized to cache recent prefixes proportionally with concurrency:
+# checkpoint_budget = max_num_reqs * DEFAULT_MAMBA_CHECKPOINT_BUDGET_MULTIPLIER
+DEFAULT_MAMBA_CHECKPOINT_BUDGET_MULTIPLIER = 2
+
 
 def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     return isinstance(attn_module, DeepseekV4IndexerCache) or isinstance(
@@ -346,21 +351,10 @@ class KVCacheManager:
             both unset.
         """
         cache_config = self.runner.cache_config
-        if cache_config.num_gpu_blocks_override is not None:
-            return
-
-        if getattr(cache_config, "mamba_cache_mode", "none") == "align":
-            # Mamba prefix caching addresses recurrent state by block id from
-            # the mamba block table, so every layer's mamba array must span
-            # the whole block pool. The compact layout deliberately makes it
-            # smaller than the pool, which would put valid block ids out of
-            # range. Fall back to the uniform sizing, which already charges
-            # each block for its mamba pages.
-            logger.info(
-                "Compact-mamba sizing skipped: mamba_cache_mode='align' "
-                "needs one mamba slot per block id. Attention capacity is "
-                "lower than with prefix caching off; raise --block-size to "
-                "trade prefix-cache granularity for capacity.")
+        is_align_mode = (getattr(cache_config, "mamba_cache_mode",
+                                     "none") == "align")
+        num_gpu_blocks_override = cache_config.num_gpu_blocks_override is not None
+        if num_gpu_blocks_override and not is_align_mode:
             return
 
         devices = self.runner.mesh.devices.flatten()
@@ -450,18 +444,22 @@ class KVCacheManager:
 
         cache_config.num_gpu_blocks_override = int(attn_num_blocks)
         self._mamba_num_blocks = int(mamba_num_blocks)
+        cache_config.mamba_num_blocks = int(mamba_num_blocks)
+        from tpu_inference.core.hybrid_coordinator import set_mamba_num_blocks
+        set_mamba_num_blocks(int(mamba_num_blocks))
 
         attn_bytes = num_attn_layers * attn_num_blocks * attn_page_size_bytes
         mamba_bytes = (num_mamba_layers * mamba_num_blocks *
                        unpadded_mamba_page_size_bytes)
+        mode_str = " (align mode)" if is_align_mode else ""
         logger.info(
-            "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
+            "Compact-mamba KV cache%s: num_gpu_blocks_override=%d (attn), "
             "_mamba_num_blocks=%d. HBM split: attn=%d layers × %d blocks "
             "× %d B = %.2f GiB; mamba=%d layers × %d slots × %d B = "
-            "%.2f GiB; total=%.2f GiB / avail=%.2f GiB.", attn_num_blocks,
-            mamba_num_blocks, num_attn_layers, attn_num_blocks,
-            attn_page_size_bytes, attn_bytes / (2**30), num_mamba_layers,
-            mamba_num_blocks, unpadded_mamba_page_size_bytes,
+            "%.2f GiB; total=%.2f GiB / avail=%.2f GiB.", mode_str,
+            attn_num_blocks, mamba_num_blocks, num_attn_layers,
+            attn_num_blocks, attn_page_size_bytes, attn_bytes / (2**30),
+            num_mamba_layers, mamba_num_blocks, unpadded_mamba_page_size_bytes,
             mamba_bytes / (2**30), (attn_bytes + mamba_bytes) / (2**30),
             avail / (2**30))
 
@@ -904,6 +902,7 @@ class KVCacheManager:
                     self.runner.max_num_reqs, mamba_slot_stride, divisor)
             if self.actual_mamba_num_blocks is None:
                 self.actual_mamba_num_blocks = mamba_num_blocks
+            kv_cache_config.mamba_num_blocks = int(mamba_num_blocks)
 
             offset = getattr(kv_cache_tensor, 'offset', 0)
             layer_stride = getattr(kv_cache_tensor, 'layer_stride', 0)

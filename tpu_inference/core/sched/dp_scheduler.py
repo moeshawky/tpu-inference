@@ -992,6 +992,14 @@ class DPScheduler(SchedulerInterface):
             getattr(o, "pending_structured_output_tokens", False)
             for o in rank_outputs)
 
+        # Combine preempted request IDs (carried over from rank schedulers).
+        # Defensive getattr: rank outputs should carry sets, but never
+        # crash the combine on a missing field.
+        combined_preempted_req_ids = set()
+        for output in rank_outputs:
+            combined_preempted_req_ids.update(
+                getattr(output, "preempted_req_ids", None) or ())
+
         return DPSchedulerOutput(
             scheduled_new_reqs=all_new_reqs,
             scheduled_cached_reqs=combined_cached_data,
@@ -1008,6 +1016,7 @@ class DPScheduler(SchedulerInterface):
             kv_connector_metadata=combined_kv_connector_metadata,
             has_structured_output_requests=has_structured_output_requests,
             pending_structured_output_tokens=pending_structured_output_tokens,
+            preempted_req_ids=combined_preempted_req_ids,
         )
 
     def _combine_cached_request_data(

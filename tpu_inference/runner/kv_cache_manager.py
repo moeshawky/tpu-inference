@@ -885,13 +885,13 @@ class KVCacheManager:
 
             mamba_cache_mode = getattr(self.runner.cache_config,
                                        "mamba_cache_mode", "none")
-            if mamba_cache_mode == "align":
+            if self._mamba_num_blocks is not None:
+                mamba_num_blocks = self._mamba_num_blocks
+            elif mamba_cache_mode == "align":
                 # Mamba prefix caching ("align" mode) addresses recurrent
                 # state by block ID from the mamba block table, so every
                 # layer's mamba array must span the full block pool.
                 mamba_num_blocks = tensor_num_blocks
-            elif self._mamba_num_blocks is not None:
-                mamba_num_blocks = self._mamba_num_blocks
             else:
                 # Mamba state is recurrent: one slot per *active* request,
                 # regardless of context length.  Falling back to

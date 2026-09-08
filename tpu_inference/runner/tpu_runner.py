@@ -2797,9 +2797,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 # `_pre_async_results.placeholder_req_id_to_index` from the previous step.
                 # Without this check, we would incorrectly perform token substitution
                 # for a resumed prefill request.
+                logger.warning(
+                    "SCHED-TRACE resumed req=%s status=RUNNING",
+                    req_id,
+                )
                 if is_prefill:
                     # Skip substitution for prefill requests (including chunked prefill)
-                    logger.warning(
+                    logger.debug(
                         "Skipping async substitution for prefill %s scheduled=%d",
                         req_id, num_scheduled_tokens_per_req[i])
                     continue

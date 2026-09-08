@@ -434,6 +434,19 @@ class KVCacheManager:
         attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
                                                     attn_page_size_bytes)
         attn_num_blocks = (attn_num_blocks // divisor) * divisor
+        mamba_bytes = num_mamba_layers * mamba_num_blocks * unpadded_mamba_page_size_bytes
+        headroom = int(1.5 * 1024**3)
+        attn_per_block_bytes = num_attn_layers * attn_page_size_bytes
+        N_max = (avail - mamba_bytes - headroom) // attn_per_block_bytes
+        if N_max < attn_num_blocks:
+            logger.info(
+                "Compact-mamba headroom clamp: "
+                "num_gpu_blocks_override %d → %d "
+                "(avail=%d B, mamba_bytes=%d B, headroom=%d B, "
+                "attn_per_block=%d B).",
+                attn_num_blocks, N_max, avail, mamba_bytes, headroom,
+                attn_per_block_bytes)
+            attn_num_blocks = N_max
         if attn_num_blocks <= 0:
             logger.warning(
                 "Compact-mamba sizing skipped: attn_num_blocks=0 after "

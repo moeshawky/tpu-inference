@@ -1,3 +1,14 @@
+# Fallback: upstream vLLM may not export FusedMoEFactory yet.
+# Uses FusedMoE as the fallback class for older versions.
+"""
+vLLM MoE interface for TPU inference.
+
+Bridges vLLM's FusedMoE layer contract to the TPU MoE backend. The
+central function is vllm_moe_apply, which routes through device-first
+hit paths (jax.lax.top_k on device, slot-table scatter gating) or
+host-backed expert offload (bank.route on host, device gating), and
+falls back to full-bank moe_apply when no bank is registered.
+"""
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,14 +54,15 @@ logger = init_logger(__name__)
 
 
 def _bank_gating_device(topk_vals: jax.Array, topk_ids: jax.Array,
-                        slot_table_jnp: jax.Array, slots: int) -> jax.Array:
+                         expert_to_slot_jnp: jax.Array, slots: int) -> jax.Array:
     """Build [T,S] gating on device via scatter from top-k device values.
 
-    Maps each top-k expert ID to its slot via slot_table, then scatters
-    the corresponding logit value into the gating output.
+    Maps each top-k expert ID to its slot via expert_to_slot table
+    (direction-typed expert→slot, [N] with -1 sentinel for non-resident),
+    then scatters the corresponding logit value into the gating output.
     """
     T, K = topk_ids.shape
-    slots_for_experts = slot_table_jnp[topk_ids]  # [T,K] — slot per (t,k)
+    slots_for_experts = expert_to_slot_jnp[topk_ids]  # [T,K] — slot per (t,k), expert→slot
     gating = jnp.full((T, slots), -jnp.inf, dtype=jnp.float32)
     t_idx = jnp.arange(T, dtype=jnp.int32)[:, None]
     gating = gating.at[t_idx, slots_for_experts].set(topk_vals)
@@ -90,6 +102,9 @@ def select_moe_backend_from_fused_moe_config(
 
 
 def vllm_moe_apply(layer: RoutedExperts,
+                   # Padding token routing: when MOE_ROUTE_PADDING_TO_EXPERT0 is set and
+                   # DP attention is not active, extract num_valid_tokens from attn_metadata
+                   # to avoid activating unnecessary experts for padding positions.
                    weights: FusedMoEWeights,
                    quant_method_instance: FusedMoEMethodBase,
                    x: torch.Tensor,
@@ -188,8 +203,8 @@ def vllm_moe_apply(layer: RoutedExperts,
     bank = expert_offload.get_bank(layer.layer_name)
     if bank is not None:
         # Device-first hit path: top_k on device, no device_get on [T,E] logits.
-        # Slot table built from bank attrs (resides on device after ensure_resident scatter).
-        slot_table_jnp = jnp.array(bank.slot_to_expert, dtype=jnp.int32)
+        # Expert→slot table [N] built from bank (direction-typed, -1 sentinel).
+        expert_to_slot_jnp = expert_offload._build_expert_to_slot(bank)
         topk_vals, topk_ids = jax.lax.top_k(jax_view(router_logits), layer.top_k)
         # Export tiny [T,K] int32 IDs for host-side bookkeeping (miss/over-footprint)
         topk_ids_np = np.asarray(jax.device_get(jax_view(topk_ids))).astype(np.int64)
@@ -220,13 +235,15 @@ def vllm_moe_apply(layer: RoutedExperts,
         # Residency check on host
         is_resident = np.all(np.isin(unique_ids_np, bank.slot_to_expert))
         if not is_resident:
-            bank.ensure_resident(topk_ids_np, slot_table=slot_table_jnp)
-            slot_table_jnp = jnp.array(bank.slot_to_expert, dtype=jnp.int32)
+            bank.ensure_resident(topk_ids_np,
+                                  slot_table=jnp.array(bank.slot_to_expert,
+                                                        dtype=jnp.int32))
+            expert_to_slot_jnp = expert_offload._build_expert_to_slot(bank)
             # topk_ids unchanged (same router_logits), but slot_table updated —
             # re-run top_k for fresh slot mapping
             topk_vals, topk_ids = jax.lax.top_k(jax_view(router_logits), layer.top_k)
         # All resident → device-built gating [T,S] via scatter
-        g = _bank_gating_device(topk_vals, topk_ids, slot_table_jnp, bank.slots)
+        g = _bank_gating_device(topk_vals, topk_ids, expert_to_slot_jnp, bank.slots)
         weights = FusedMoEWeights(
             w13_weight=bank.slot_w13,
             w13_weight_scale=bank.slot_w13_scale,

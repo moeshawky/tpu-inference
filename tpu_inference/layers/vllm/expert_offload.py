@@ -1,3 +1,6 @@
+# Store weight dtype tags: 0 = nibble-packed float4_e2m1fn, 1 = fp32,
+# 2 = bfloat16. These tags are written into the store header byte at
+# offset 20 and read back at open to determine row dtype and unpacking.
 """Host-backed MoE expert offload: static S-slot device cache for vLLM TPU.
 
 Each MoE layer's full expert bank (all N experts, GMM_TP processed layout)
@@ -263,11 +266,46 @@ def layer_enabled(layer_name: str) -> bool:
 
 
 def get_bank(layer_name: str) -> "_LayerBank | None":
+    """
+    Look up a registered host bank by layer name.
+
+    Returns the _LayerBank for the given layer if offload is active and the
+    layer was registered; returns None otherwise (offload disabled, layer not
+    registered, or hash-routed layer refused).
+    """
     return _BANKS.get(layer_name)
 
 
 def clear_all() -> None:
+    """
+    Remove all registered host banks from the global registry.
+
+    Intended for teardown or test cleanup; callers should ensure no in-flight
+    MoE forward references a bank after clearing.
+    """
     _BANKS.clear()
+
+
+def _build_expert_to_slot(bank) -> jax.Array:
+    """Build direction-typed expert→slot table [N] for _bank_gating_device.
+
+    Entry e = slot index if expert e is resident, -1 otherwise.
+    N derived inline from bank.w13_host.shape[0] (non-store) or
+    bank.store.n_experts (store-backed); bank carries no n_experts attr
+    by design — the bank class is not redesigned.
+    """
+    if bank.store is not None:
+        N = bank.store.n_experts
+    else:
+        N = bank.w13_host.shape[0]
+    table = jnp.full((N,), -1, dtype=jnp.int32)
+    if bank.expert_to_slot:
+        experts = jnp.array(list(bank.expert_to_slot.keys()),
+                            dtype=jnp.int32)
+        slots = jnp.array(list(bank.expert_to_slot.values()),
+                          dtype=jnp.int32)
+        table = table.at[experts].set(slots)
+    return table
 
 
 class _LayerBank:
@@ -427,6 +465,10 @@ class _LayerBank:
         return raw.view(self._float4_dtype)
 
     def _allocate_initial_slots(self) -> None:
+        # Store-backed initial residency reads S records from the canonical store
+        # (page-cache-hot right after load-time write). In scatter mode, only the
+        # device arrays are retained (no host mirror); in full-push mode, the
+        # packed S-slot host mirror is kept.
         """Initial residency: experts 0..S-1 fill the S device slots.
 
         Slot 0 holds expert 0 (the reserved padding expert); the remaining
@@ -543,13 +585,19 @@ class _LayerBank:
         self.lru = list(range(S))                  # expert ids, LRU order
 
     def ensure_resident(self, expert_ids: np.ndarray,
+                        # Victim selection: LRU-ordered residents NOT needed by the current batch,
+                        # excluding the reserved padding slot. Never-touched residents not in LRU
+                        # are included as a fallback to fill the victim list.
                         slot_table: jax.Array | None = None) -> None:
         """Guarantee all expert_ids are resident; evict + load misses.
 
-        Never evicts an expert that is still needed by the current batch, and
-        never evicts slot _PADDING_SLOT (expert 0 stays resident). If the
-        needed set exceeds the slot capacity, raises (caller should treat as
-        capacity failure rather than silently corrupt routing).
+        Never evicts an expert that is still needed by the current batch,
+        and never evicts slot _PADDING_SLOT (expert 0 stays resident). If
+        the needed set exceeds the slot capacity, raises (caller should
+        treat as capacity failure rather than silently corrupt routing).
+
+        slot_table param: slot→expert direction [S], unchanged from
+        original contract — NOT the expert→slot table used by gating.
         """
         needed = set(int(e) for e in np.unique(expert_ids))
         if not needed:
@@ -720,6 +768,8 @@ class _LayerBank:
         self.expert_to_slot[expert_id] = slot
 
     def _touch(self, expert_id: int) -> None:
+        # LRU touch: moves expert_id to the end of the LRU list (most recently
+        # used). Used by ensure_resident and _load_one to maintain eviction order.
         if expert_id in self.lru:
             self.lru.remove(expert_id)
         self.lru.append(expert_id)
@@ -944,6 +994,13 @@ def push_mode() -> str:
 
 
 def _weight_dtype_tag(array: np.ndarray) -> int:
+    """
+    Map a numpy dtype to the store header weight dtype tag.
+
+    Returns _STORE_W_FLOAT4_PACKED for float4_e2m1fn, _STORE_W_FP32 for
+    float32, _STORE_W_BF16 for bfloat16. Raises ValueError for unsupported
+    dtypes.
+    """
     name = getattr(array.dtype, "name", "")
     if name == "float4_e2m1fn":
         return _STORE_W_FLOAT4_PACKED
@@ -956,6 +1013,11 @@ def _weight_dtype_tag(array: np.ndarray) -> int:
 
 
 def _shape_u32s(shape) -> bytes:
+    """
+    Encode a shape tuple as 16 bytes of little-endian u32 values (4 dims
+    max, zero-padded). Used to pack w13/w2/s13/s2 row shapes into the
+    12288-byte store header.
+    """
     out = bytearray(16)
     for i, dim in enumerate(shape or ()):
         if i >= 4 or int(dim) < 0 or int(dim) > 0xFFFFFFFF:
@@ -967,6 +1029,11 @@ def _shape_u32s(shape) -> bytes:
 def _build_store_header(layer_id: int, n_experts: int, w_dtype_tag: int,
                         ndims, shapes, w13_bytes, w2_bytes, s13_bytes,
                         s2_bytes, record_bytes, data_bytes, shas) -> bytes:
+    """
+    Build the 12288-byte store header from layer metadata and per-record
+    sha256 digests. The header contains magic, version, layer_id, n_experts,
+    weight dtype tag, row ndims/shapes, byte counts, and the sha256 table.
+    """
     buf = bytearray(_STORE_HEADER_BYTES)
     buf[0:8] = _STORE_MAGIC
     struct.pack_into("<I", buf, 8, _STORE_VERSION)

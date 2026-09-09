@@ -3331,8 +3331,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # signature on those models is unchanged).
         # In align mode (prefix caching), mamba state indices are derived on-device
         # from the block tables, so mamba_state_indices is None.
-        if (self.kv_cache_config.has_mamba_layers and getattr(
-                self.cache_config, "mamba_cache_mode", "none") != "align"):
+        if (self.kv_cache_config.has_mamba_layers and (getattr(self.cache_config, "mamba_cache_mode", "none") != "align" or self.kv_cache_manager._mamba_num_blocks is not None)):
             # Reorder mamba_state_indices per DP rank (like block_tables)
             # and convert global slot ids to rank-local indices so they
             # index correctly into the per-rank shard of the mamba state.

@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
-import numpy as np
 import jax
-from jax.sharding import NamedSharding, PartitionSpec
 from torchax.interop import jax_view, torch_view
 from vllm.forward_context import is_forward_context_available
 from vllm.model_executor.layers import fused_moe as vllm_fused_moe
@@ -171,9 +169,8 @@ def vllm_moe_apply(layer: RoutedExperts,
     # offload gates refuse layers with bias).
     bank = expert_offload.get_bank(layer.layer_name)
     if bank is not None:
-        logits_np = np.asarray(jax.device_get(jax_view(router_logits)))
-        g_np = bank.route(logits_np, layer.top_k)
-        g = jax.device_put(g_np, NamedSharding(mesh, PartitionSpec()))
+        slot_table = bank.slot_table
+        g = bank.route(jax_view(router_logits), layer.top_k, slot_table=slot_table)
         weights = FusedMoEWeights(
             w13_weight=bank.slot_w13,
             w13_weight_scale=bank.slot_w13_scale,

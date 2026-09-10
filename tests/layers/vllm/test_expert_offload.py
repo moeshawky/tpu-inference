@@ -158,6 +158,8 @@ def test_register_bank_with_scales(cpu_mesh, monkeypatch):
 def test_load_one_refreshes_scale_with_weight(cpu_mesh, monkeypatch):
     """_load_one swaps BOTH the weight and the scale for the new expert."""
     _enable_offload(monkeypatch)
+    # Legacy full-push contract: host slot mirror rows carry the refresh.
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_PUSH_MODE", "full")
     (w13, w2, w13s, w2s) = _make_bank_data()
     (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
 
@@ -189,6 +191,8 @@ def test_load_one_refreshes_scale_with_weight(cpu_mesh, monkeypatch):
 def test_eviction_swaps_weight_and_scale_atomically(cpu_mesh, monkeypatch):
     """ensure_resident eviction swaps weight+scale pairs for every victim."""
     _enable_offload(monkeypatch)
+    # Legacy full-push contract: host slot mirror rows carry the refresh.
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_PUSH_MODE", "full")
     (w13, w2, w13s, w2s) = _make_bank_data()
     (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
 
@@ -209,6 +213,38 @@ def test_eviction_swaps_weight_and_scale_atomically(cpu_mesh, monkeypatch):
     assert bank.expert_to_slot[6] == bank.slot_to_expert.index(6)
     # Slot 0 is still pinned to expert 0.
     assert bank.slot_to_expert[0] == 0
+
+
+def test_load_one_scatter_updates_device_row(cpu_mesh, monkeypatch):
+    """Scatter _load_one refreshes the device row with no host mirror."""
+    # No PUSH_MODE pin: env default is scatter, so slot13_host stays None.
+    _enable_offload(monkeypatch)
+    (w13, w2, w13s, w2s) = _make_bank_data()
+    (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
+
+    bank = expert_offload.register_bank(
+        "model.layers.3.ffn.experts", w13, w2, w13_sh, w2_sh,
+        w13_scale_host=w13s, w2_scale_host=w2s,
+        dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
+        layer=_FakeLayer())
+    assert bank.push_mode == "scatter"
+    # Evict expert 1 (slot 1) in favor of expert 7.
+    bank._load_one(slot=1, expert_id=7)
+
+    assert bank.slot_to_expert[1] == 7
+    # Scatter banks carry no host mirror by design (device-first).
+    assert bank.slot13_host is None
+    # Device rows carry expert 7's markers (same convention as
+    # _make_bank_data: w13 = 1000+e, w2 = 2000+e, scales 3000/4000+e).
+    assert np.asarray(jax.device_get(bank.slot_w13))[1][0, 0] == 1000.0 + 7
+    assert np.allclose(np.asarray(jax.device_get(bank.slot_w13))[1],
+                       w13[7])
+    assert np.allclose(np.asarray(jax.device_get(bank.slot_w2))[1],
+                       w2[7])
+    assert np.allclose(np.asarray(jax.device_get(bank.slot_w13_scale))[1],
+                       w13s[7])
+    assert np.allclose(np.asarray(jax.device_get(bank.slot_w2_scale))[1],
+                       w2s[7])
 
 
 def test_hash_indices_table_guard_refuses_registration(cpu_mesh,
@@ -685,3 +721,72 @@ def test_store_register_rejects_hash_routed_and_env_off(tmp_path, cpu_mesh,
         dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
         layer=_FakeLayer(), store_path=str(path))
     assert bank2 is None
+
+
+def test_route_device_matches_legacy(cpu_mesh, monkeypatch):
+    """S5: device route matches the legacy host gating (single-wave only)."""
+    _enable_offload(monkeypatch)
+    # Legacy full-push contract: slot_table is None, dict slot lookup.
+    monkeypatch.setenv("MOE_EXPERT_OFFLOAD_PUSH_MODE", "full")
+    (w13, w2, w13s, w2s) = _make_bank_data()
+    (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
+    bank = expert_offload.register_bank(
+        "model.layers.3.ffn.experts", w13, w2, w13_sh, w2_sh,
+        w13_scale_host=w13s, w2_scale_host=w2s,
+        dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
+        layer=_FakeLayer())
+    assert bank.slot_table is None
+    rng = np.random.default_rng(11)
+    T, TOP_K = 6, 2
+    pool = [0, 5, 6]  # |unique| = 3 <= S_l = 3: single wave
+    logits = np.full((T, N_EXPERTS), -10.0, dtype=np.float32)
+    for t in range(T):
+        for e in rng.choice(pool, size=TOP_K, replace=False):
+            logits[t, int(e)] = float(rng.normal(2.0, 1.0))
+    g_legacy = bank.route(logits, TOP_K)
+    assert isinstance(g_legacy, np.ndarray)
+    assert g_legacy.shape == (T, S_SLOTS)
+    g_device = bank.route(jax.numpy.asarray(logits), TOP_K,
+                          slot_table=bank.slot_table)
+    assert isinstance(g_device, jax.Array)
+    assert g_device.shape == (T, S_SLOTS)
+    assert np.allclose(np.asarray(g_device), g_legacy)
+
+
+def test_eviction_refreshes_slot_table(cpu_mesh, monkeypatch):
+    """Scatter slot_table is host-sized [N] and refreshed on eviction."""
+    _enable_offload(monkeypatch)
+    (w13, w2, w13s, w2s) = _make_bank_data()
+    (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
+
+    bank = expert_offload.register_bank(
+        "model.layers.3.ffn.experts", w13, w2, w13_sh, w2_sh,
+        w13_scale_host=w13s, w2_scale_host=w2s,
+        dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
+        layer=_FakeLayer())
+
+    assert bank.push_mode == "scatter"
+    # Host table covers all N experts; initial slots hold experts 0..S-1.
+    assert isinstance(bank.slot_table, np.ndarray)
+    assert bank.slot_table.shape == (N_EXPERTS,)
+    assert bank.slot_table.tolist() == (
+        list(range(S_SLOTS)) + [-1] * (N_EXPERTS - S_SLOTS))
+    # Evict expert 1 (slot 1, non-padding) in favor of expert 7 (>= S).
+    bank._load_one(slot=1, expert_id=7)
+    assert int(bank.slot_table[7]) == 1
+    assert int(bank.slot_table[1]) == -1
+    # Device route covering expert 7 returns sane gating at mapped slots.
+    logits = np.full((2, N_EXPERTS), -10.0, dtype=np.float32)
+    logits[0, 7] = 5.0
+    logits[0, 0] = 4.0
+    logits[1, 7] = 3.0
+    logits[1, 2] = 2.0
+    g = bank.route(jax.numpy.asarray(logits), 2,
+                   slot_table=bank.slot_table)
+    assert isinstance(g, jax.Array)
+    assert g.shape == (2, S_SLOTS)
+    g_host = np.asarray(g)
+    assert np.isclose(g_host[0, int(bank.slot_table[7])], 5.0)
+    assert np.isclose(g_host[0, int(bank.slot_table[0])], 4.0)
+    assert np.isclose(g_host[1, int(bank.slot_table[7])], 3.0)
+    assert np.isclose(g_host[1, int(bank.slot_table[2])], 2.0)

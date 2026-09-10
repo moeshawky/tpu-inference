@@ -159,7 +159,7 @@ def gdn_attention_core_tpu(
                                               dp_size)
 
     cache_config = vllm_context.vllm_config.cache_config
-    if cache_config.mamba_cache_mode == "align" or state_indices is None:
+    if state_indices is None:
         # Mamba prefix caching ("align" mode): derive read/write state slots
         # from the mamba block table directly on TPU.
         block_tables = block_tables.reshape(seq_lens.shape[0], -1)

@@ -786,6 +786,13 @@ class _LayerBank:
 
         np.ndarray input runs the host path; jax.Array input runs the
         device path (device top-k, S_l-bounded token waves, jnp gating).
+
+        io_callback(wave_tokens, wave_expert_ids): called once per wave
+        on the device path with (np.int64 [W], np.int64 [W,top_k]) —
+        wave_tokens are global token indices in order; wave_expert_ids
+        are the per-token top-k expert ids. May be None (default, no
+        callback). Legacy np input: callback ignored, host path fully
+        observable already.
         """
         # legacy host path (tests/stage4) — bit-identical
         if isinstance(router_logits, np.ndarray):
@@ -804,6 +811,7 @@ class _LayerBank:
                     if s is not None:
                         gating[t, s] = router_logits[t, int(e)]
             return gating
+        # legacy np path: no io_callback — host path fully observable already
         # Device path: top-k stays on device; only the [T, top_k] ids cross
         # to host to drive residency. Gating values are gathered from the
         # device logits with jnp ops (no host materialization of logits).
@@ -833,7 +841,8 @@ class _LayerBank:
                 {int(e) for t in wave for e in expert_ids_host[t]},
                 dtype=np.int64)
             if io_callback is not None:
-                io_callback(need)
+                io_callback(np.asarray(wave, dtype=np.int64),
+                            np.asarray(expert_ids_host[wave], dtype=np.int64))
             self.ensure_resident(need)
             wave_gating = jnp.full((len(wave), S), -jnp.inf,
                                    dtype=jnp.float32)

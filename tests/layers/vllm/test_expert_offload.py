@@ -790,3 +790,46 @@ def test_eviction_refreshes_slot_table(cpu_mesh, monkeypatch):
     assert np.isclose(g_host[0, int(bank.slot_table[0])], 4.0)
     assert np.isclose(g_host[1, int(bank.slot_table[7])], 3.0)
     assert np.isclose(g_host[1, int(bank.slot_table[2])], 2.0)
+
+
+def test_route_callback_exports_per_token_ids(cpu_mesh, monkeypatch):
+    """Callback receives per-wave (wave_tokens, wave_expert_ids);
+    concatenated in wave order == jax.lax.top_k token-ordered ids."""
+    _enable_offload(monkeypatch)
+    (w13, w2, w13s, w2s) = _make_bank_data()
+    (w13_sh, w2_sh, w13s_sh, w2s_sh) = _shardings(cpu_mesh)
+    bank = expert_offload.register_bank(
+        "model.layers.3.ffn.experts", w13, w2, w13_sh, w2_sh,
+        w13_scale_host=w13s, w2_scale_host=w2s,
+        dev_w13_scale_sharding=w13s_sh, dev_w2_scale_sharding=w2s_sh,
+        layer=_FakeLayer())
+
+    calls = []
+    def recording_callback(wave_tokens, wave_expert_ids):
+        calls.append((np.asarray(wave_tokens), np.asarray(wave_expert_ids)))
+
+    T, TOP_K = 6, 2
+    # pool: |unique| = 3 <= S_l = 3 forces multi-wave partitioning
+    pool = [0, 5, 6]
+    rng = np.random.default_rng(99)
+    logits = np.full((T, N_EXPERTS), -10.0, dtype=np.float32)
+    for t in range(T):
+        for e in rng.choice(pool, size=TOP_K, replace=False):
+            logits[t, int(e)] = float(rng.normal(2.0, 1.0))
+    jax_logits = jax.numpy.asarray(logits)
+    gating = bank.route(jax_logits, TOP_K, io_callback=recording_callback)
+
+    # E2: waves exist -> callback fired
+    assert calls, "callback should fire for multi-wave device route"
+    # Dtypes int64 on every payload
+    for wave_tokens, wave_expert_ids in calls:
+        assert wave_tokens.dtype == np.int64
+        assert wave_expert_ids.dtype == np.int64
+    # Concatenated wave_expert_ids in wave order == token-ordered top_k ids
+    stacked = np.concatenate([w for _, w in calls], axis=0)
+    _, topk_ids = jax.lax.top_k(jax_logits, TOP_K)
+    expected = np.asarray(topk_ids, dtype=np.int64)
+    assert np.array_equal(stacked, expected)
+    # wave_tokens are global token indices in order, partitioned across waves
+    all_tokens = np.concatenate([t for t, _ in calls], axis=0)
+    assert all_tokens.tolist() == list(range(T))

@@ -1,3 +1,6 @@
+# Store weight dtype tags: 0 = nibble-packed float4_e2m1fn, 1 = fp32,
+# 2 = bfloat16. These tags are written into the store header byte at
+# offset 20 and read back at open to determine row dtype and unpacking.
 """Host-backed MoE expert offload: static S-slot device cache for vLLM TPU.
 
 Each MoE layer's full expert bank (all N experts, GMM_TP processed layout)
@@ -263,11 +266,46 @@ def layer_enabled(layer_name: str) -> bool:
 
 
 def get_bank(layer_name: str) -> "_LayerBank | None":
+    """
+    Look up a registered host bank by layer name.
+
+    Returns the _LayerBank for the given layer if offload is active and the
+    layer was registered; returns None otherwise (offload disabled, layer not
+    registered, or hash-routed layer refused).
+    """
     return _BANKS.get(layer_name)
 
 
 def clear_all() -> None:
+    """
+    Remove all registered host banks from the global registry.
+
+    Intended for teardown or test cleanup; callers should ensure no in-flight
+    MoE forward references a bank after clearing.
+    """
     _BANKS.clear()
+
+
+def _build_expert_to_slot(bank) -> jax.Array:
+    """Build direction-typed expert→slot table [N] for _bank_gating_device.
+
+    Entry e = slot index if expert e is resident, -1 otherwise.
+    N derived inline from bank.w13_host.shape[0] (non-store) or
+    bank.store.n_experts (store-backed); bank carries no n_experts attr
+    by design — the bank class is not redesigned.
+    """
+    if bank.store is not None:
+        N = bank.store.n_experts
+    else:
+        N = bank.w13_host.shape[0]
+    table = jnp.full((N,), -1, dtype=jnp.int32)
+    if bank.expert_to_slot:
+        experts = jnp.array(list(bank.expert_to_slot.keys()),
+                            dtype=jnp.int32)
+        slots = jnp.array(list(bank.expert_to_slot.values()),
+                          dtype=jnp.int32)
+        table = table.at[experts].set(slots)
+    return table
 
 
 class _LayerBank:
@@ -326,7 +364,11 @@ class _LayerBank:
         else:
             self.w13_host = w13_host            # processed host mirror [N, ...]
             self.w2_host = w2_host              # processed host mirror [N, ...]
-            self.push_mode = "full"
+            if push_mode not in ("scatter", "full"):
+                raise ValueError(
+                    f"[expert-offload] layer {layer_name}: push_mode must be "
+                    f"'scatter' or 'full', got {push_mode!r}")
+            self.push_mode = push_mode
             # JAX float4 uses one byte per value in host NumPy storage,
             # although only the low nibble is meaningful. Pack two codes per
             # byte to keep all 40 processed banks resident without an
@@ -423,6 +465,10 @@ class _LayerBank:
         return raw.view(self._float4_dtype)
 
     def _allocate_initial_slots(self) -> None:
+        # Store-backed initial residency reads S records from the canonical store
+        # (page-cache-hot right after load-time write). In scatter mode, only the
+        # device arrays are retained (no host mirror); in full-push mode, the
+        # packed S-slot host mirror is kept.
         """Initial residency: experts 0..S-1 fill the S device slots.
 
         Slot 0 holds expert 0 (the reserved padding expert); the remaining
@@ -538,18 +584,33 @@ class _LayerBank:
         self.expert_to_slot = {e: s for s, e in enumerate(self.slot_to_expert)}
         self.lru = list(range(S))                  # expert ids, LRU order
 
-    def ensure_resident(self, expert_ids: np.ndarray) -> None:
+    def ensure_resident(self, expert_ids: np.ndarray,
+                        # Victim selection: LRU-ordered residents NOT needed by the current batch,
+                        # excluding the reserved padding slot. Never-touched residents not in LRU
+                        # are included as a fallback to fill the victim list.
+                        slot_table: jax.Array | None = None) -> None:
         """Guarantee all expert_ids are resident; evict + load misses.
 
-        Never evicts an expert that is still needed by the current batch, and
-        never evicts slot _PADDING_SLOT (expert 0 stays resident). If the
-        needed set exceeds the slot capacity, raises (caller should treat as
-        capacity failure rather than silently corrupt routing).
+        Never evicts an expert that is still needed by the current batch,
+        and never evicts slot _PADDING_SLOT (expert 0 stays resident). If
+        the needed set exceeds the slot capacity, raises (caller should
+        treat as capacity failure rather than silently corrupt routing).
+
+        slot_table param: slot→expert direction [S], unchanged from
+        original contract — NOT the expert→slot table used by gating.
         """
         needed = set(int(e) for e in np.unique(expert_ids))
         if not needed:
             return
-        resident = set(self.expert_to_slot)
+        # Explicit slot_table operand when provided; fallback to dict.
+        if slot_table is not None:
+            try:
+                # slot_table is [S] array (JAX or numpy) of expert ids per slot.
+                resident = set(int(e) for e in np.asarray(slot_table))
+            except Exception:
+                resident = set(self.expert_to_slot)
+        else:
+            resident = set(self.expert_to_slot)
         misses = needed - resident
         if not misses:
             for e in needed:
@@ -646,26 +707,59 @@ class _LayerBank:
                     self.slot_w13_scale.block_until_ready()
                     self.slot_w2_scale.block_until_ready()
         else:
-            self.slot13_host[slot] = self._unpack_weight_rows(
-                self.w13_host[expert_id:expert_id + 1], self._w13_packed)[0]
-            self.slot2_host[slot] = self._unpack_weight_rows(
-                self.w2_host[expert_id:expert_id + 1], self._w2_packed)[0]
-            if self.w13_scale_host is not None:
-                self.slot13_scale_host[slot] = self.w13_scale_host[expert_id]
-                self.slot2_scale_host[slot] = self.w2_scale_host[expert_id]
-            self.slot_w13 = jax.device_put(self.slot13_host,
-                                           self.dev_w13_sharding)
-            self.slot_w2 = jax.device_put(self.slot2_host, self.dev_w2_sharding)
-            if self.w13_scale_host is not None:
-                self.slot_w13_scale = jax.device_put(
-                    self.slot13_scale_host, self.dev_w13_scale_sharding)
-                self.slot_w2_scale = jax.device_put(
-                    self.slot2_scale_host, self.dev_w2_scale_sharding)
-            self.slot_w13.block_until_ready()
-            self.slot_w2.block_until_ready()
-            if self.w13_scale_host is not None:
-                self.slot_w13_scale.block_until_ready()
-                self.slot_w2_scale.block_until_ready()
+            if self.push_mode == "scatter":
+                w13_row = self._unpack_weight_rows(
+                    self.w13_host[expert_id:expert_id + 1], self._w13_packed)[0]
+                w2_row = self._unpack_weight_rows(
+                    self.w2_host[expert_id:expert_id + 1], self._w2_packed)[0]
+                # Keep host slot mirror in sync for test/debug visibility;
+                # device transfer is scatter (one row, _row_sharding).
+                self.slot13_host[slot] = w13_row
+                self.slot2_host[slot] = w2_row
+                if self.w13_scale_host is not None:
+                    self.slot13_scale_host[slot] = self.w13_scale_host[expert_id]
+                    self.slot2_scale_host[slot] = self.w2_scale_host[expert_id]
+                self.slot_w13 = self.slot_w13.at[slot].set(
+                    jax.device_put(
+                        w13_row, self._row_sharding(self.dev_w13_sharding)))
+                self.slot_w2 = self.slot_w2.at[slot].set(
+                    jax.device_put(
+                        w2_row, self._row_sharding(self.dev_w2_sharding)))
+                if self.w13_scale_host is not None:
+                    self.slot_w13_scale = self.slot_w13_scale.at[slot].set(
+                        jax.device_put(
+                            np.array(self.w13_scale_host[expert_id]),
+                            self._row_sharding(self.dev_w13_scale_sharding)))
+                    self.slot_w2_scale = self.slot_w2_scale.at[slot].set(
+                        jax.device_put(
+                            np.array(self.w2_scale_host[expert_id]),
+                            self._row_sharding(self.dev_w2_scale_sharding)))
+                self.slot_w13.block_until_ready()
+                self.slot_w2.block_until_ready()
+                if self.w13_scale_host is not None:
+                    self.slot_w13_scale.block_until_ready()
+                    self.slot_w2_scale.block_until_ready()
+            else:
+                self.slot13_host[slot] = self._unpack_weight_rows(
+                    self.w13_host[expert_id:expert_id + 1], self._w13_packed)[0]
+                self.slot2_host[slot] = self._unpack_weight_rows(
+                    self.w2_host[expert_id:expert_id + 1], self._w2_packed)[0]
+                if self.w13_scale_host is not None:
+                    self.slot13_scale_host[slot] = self.w13_scale_host[expert_id]
+                    self.slot2_scale_host[slot] = self.w2_scale_host[expert_id]
+                self.slot_w13 = jax.device_put(self.slot13_host,
+                                               self.dev_w13_sharding)
+                self.slot_w2 = jax.device_put(self.slot2_host, self.dev_w2_sharding)
+                if self.w13_scale_host is not None:
+                    self.slot_w13_scale = jax.device_put(
+                        self.slot13_scale_host, self.dev_w13_scale_sharding)
+                    self.slot_w2_scale = jax.device_put(
+                        self.slot2_scale_host, self.dev_w2_scale_sharding)
+                self.slot_w13.block_until_ready()
+                self.slot_w2.block_until_ready()
+                if self.w13_scale_host is not None:
+                    self.slot_w13_scale.block_until_ready()
+                    self.slot_w2_scale.block_until_ready()
         old = int(self.slot_to_expert[slot])
         self.expert_to_slot.pop(old, None)
         if old in self.lru:
@@ -674,6 +768,8 @@ class _LayerBank:
         self.expert_to_slot[expert_id] = slot
 
     def _touch(self, expert_id: int) -> None:
+        # LRU touch: moves expert_id to the end of the LRU list (most recently
+        # used). Used by ensure_resident and _load_one to maintain eviction order.
         if expert_id in self.lru:
             self.lru.remove(expert_id)
         self.lru.append(expert_id)
@@ -688,16 +784,27 @@ class _LayerBank:
         """
         return self.slot_w13, self.slot_w2, self.slot_w13_scale, self.slot_w2_scale
 
-    def route(self, router_logits: np.ndarray,
-              top_k: int) -> np.ndarray:
-        """Host topk -> ensure resident -> build remapped [T, S] gating."""
+    def _route_single_wave(self, router_logits: np.ndarray,
+                           top_k: int) -> np.ndarray:
+        """Bit-identical single-wave route body (pre-wave implementation).
+
+        This is the CURRENT route() body preserved verbatim for the
+        single-wave fast path (B01 R-08: bit-identical delegation). Wave
+        execution must delegate here when |unique_ids| ≤ S-1 so behavior is
+        identical to the pre-wave code.
+        """
         T, E = router_logits.shape
         unique_ids: set[int] = set()
         for t in range(T):
             top_ids = np.argpartition(router_logits[t], -top_k)[-top_k:]
             unique_ids.update(int(e) for e in top_ids)
         if unique_ids:
-            self.ensure_resident(np.fromiter(unique_ids, dtype=np.int64))
+            # F-4 caller contract: construct slot_table as explicit operand
+            # (B01 §7b, no **kwargs) and pass to ensure_resident.
+            # Construction site: _route_single_wave line ~743-744.
+            slot_table = jnp.asarray(self.slot_to_expert, dtype=jnp.int32)
+            self.ensure_resident(np.fromiter(unique_ids, dtype=np.int64),
+                                 slot_table=slot_table)
         gating = np.full((T, self.slots), -np.inf, dtype=np.float32)
         for t in range(T):
             top_ids = np.argpartition(router_logits[t], -top_k)[-top_k:]
@@ -706,6 +813,66 @@ class _LayerBank:
                 if s is not None:
                     gating[t, s] = router_logits[t, int(e)]
         return gating
+
+    def route(self, router_logits: np.ndarray,
+              top_k: int) -> np.ndarray:
+        """Host topk -> ensure resident -> build remapped [T, S] gating.
+
+        Wave-batched: footprint-capped greedy in-order pack where
+        unique_per_wave ≤ S-1 (slot 0 reserved for pinned expert 0).
+        Single-wave fast path delegates bit-identically to
+        _route_single_wave(). Each wave does ensure_resident -> gating
+        -> concat along token dimension.
+        """
+        T, E = router_logits.shape
+        if T == 0:
+            return np.full((0, self.slots), -np.inf, dtype=np.float32)
+        # Precompute per-token top-k unique sets for packing.
+        per_token_top = []
+        per_token_unique = []
+        for t in range(T):
+            top_ids = np.argpartition(router_logits[t], -top_k)[-top_k:]
+            per_token_top.append(top_ids)
+            uniq = set(int(e) for e in top_ids)
+            per_token_unique.append(uniq)
+            if len(uniq) > self.slots - 1:
+                raise RuntimeError(
+                    f"[expert-offload] layer {self.layer_name}: single token "
+                    f"needs {len(uniq)} unique experts (top_k={top_k}) but "
+                    f"S={self.slots} (available S-1={self.slots - 1} with "
+                    f"slot 0 pinned to expert 0). Increase "
+                    f"MOE_EXPERT_OFFLOAD_SLOTS or reduce top_k.")
+        # Greedy in-order packing: unique_per_wave ≤ S-1.
+        waves: list[list[int]] = []
+        cur_wave: list[int] = []
+        cur_unique: set[int] = set()
+        for t, uniq in enumerate(per_token_unique):
+            if len(cur_unique | uniq) > self.slots - 1:
+                if not cur_wave:
+                    # Single token already checked above; defensive.
+                    raise RuntimeError(
+                        f"[expert-offload] layer {self.layer_name}: token {t} "
+                        f"unique {len(uniq)} exceeds S-1={self.slots - 1}")
+                waves.append(cur_wave)
+                cur_wave = [t]
+                cur_unique = set(uniq)
+            else:
+                cur_wave.append(t)
+                cur_unique.update(uniq)
+        if cur_wave:
+            waves.append(cur_wave)
+        # Single-wave fast path: bit-identical to pre-wave route().
+        if len(waves) == 1:
+            return self._route_single_wave(router_logits, top_k)
+        # Multi-wave: per-wave ensure_resident -> gating -> concat.
+        gatings = []
+        for wave_tokens in waves:
+            wave_logits = router_logits[wave_tokens]
+            # Use single-wave body for per-wave gating (ensures per-wave
+            # ensure_resident + remapping). Slice result already [len(wave), S].
+            g = self._route_single_wave(wave_logits, top_k)
+            gatings.append(g)
+        return np.concatenate(gatings, axis=0)
 
 
 def _host_array(layer_name: str, field: str, value: jax.Array) -> np.ndarray:
@@ -827,6 +994,13 @@ def push_mode() -> str:
 
 
 def _weight_dtype_tag(array: np.ndarray) -> int:
+    """
+    Map a numpy dtype to the store header weight dtype tag.
+
+    Returns _STORE_W_FLOAT4_PACKED for float4_e2m1fn, _STORE_W_FP32 for
+    float32, _STORE_W_BF16 for bfloat16. Raises ValueError for unsupported
+    dtypes.
+    """
     name = getattr(array.dtype, "name", "")
     if name == "float4_e2m1fn":
         return _STORE_W_FLOAT4_PACKED
@@ -839,6 +1013,11 @@ def _weight_dtype_tag(array: np.ndarray) -> int:
 
 
 def _shape_u32s(shape) -> bytes:
+    """
+    Encode a shape tuple as 16 bytes of little-endian u32 values (4 dims
+    max, zero-padded). Used to pack w13/w2/s13/s2 row shapes into the
+    12288-byte store header.
+    """
     out = bytearray(16)
     for i, dim in enumerate(shape or ()):
         if i >= 4 or int(dim) < 0 or int(dim) > 0xFFFFFFFF:
@@ -850,6 +1029,11 @@ def _shape_u32s(shape) -> bytes:
 def _build_store_header(layer_id: int, n_experts: int, w_dtype_tag: int,
                         ndims, shapes, w13_bytes, w2_bytes, s13_bytes,
                         s2_bytes, record_bytes, data_bytes, shas) -> bytes:
+    """
+    Build the 12288-byte store header from layer metadata and per-record
+    sha256 digests. The header contains magic, version, layer_id, n_experts,
+    weight dtype tag, row ndims/shapes, byte counts, and the sha256 table.
+    """
     buf = bytearray(_STORE_HEADER_BYTES)
     buf[0:8] = _STORE_MAGIC
     struct.pack_into("<I", buf, 8, _STORE_VERSION)
@@ -1331,6 +1515,7 @@ def register_bank(layer_name: str, w13_host: jax.Array, w2_host: jax.Array,
                 layer_name, "w2_scale", w2_scale_host),
             dev_w13_scale_sharding,
             dev_w2_scale_sharding,
+            push_mode=push_mode(),
         )
     _BANKS[layer_name] = bank
     return bank

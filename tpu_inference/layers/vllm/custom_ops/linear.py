@@ -204,30 +204,54 @@ class VllmQKVParallelLinear(QKVParallelLinear):
         i = mesh.axis_names.index(kv_head_axis)
         kv_size = mesh.axis_sizes[i]
         kv_type = mesh.axis_types[i]
-        new_mesh = jax.sharding.AbstractMesh(
-            mesh.axis_sizes[:i] + (kv_size // replicas, replicas) +
-            mesh.axis_sizes[i + 1:],
-            mesh.axis_names[:i] + (kv_head_axis, replica_axis) +
-            mesh.axis_names[i + 1:],
-            mesh.axis_types[:i] + (kv_type, kv_type) + mesh.axis_types[i + 1:],
-        )
-        if isinstance(head_axis, tuple):
-            in_head_axis = list(head_axis)
-            in_head_axis.insert(
-                in_head_axis.index(kv_head_axis) + 1, replica_axis)
-        else:
-            in_head_axis = (head_axis, replica_axis)
 
-        @shard_map(mesh=new_mesh,
-                   in_specs=P(data_axis, in_head_axis),
-                   out_specs=P(data_axis, head_axis),
-                   check_vma=False)
-        def _mark_kv_head_replicated(t):
-            return t
+        # Skip the shard_map identity for the known-illegal mesh shape.
+        # Evidence (empirical; see route note below):
+        #   Flash model, 2 KV heads, TP8, replicas=4: ambient ATTN_HEAD
+        #   axis=8 → new mesh (model:2, replica:4) triggers JAX
+        #   ValueError "nesting"; Qwen3-8B FP8, TP8, replicas=2 → new
+        #   mesh (model:4, replica:2) serves 4/4 coherent on baseline.
+        # Predicate: skip when replica axis strictly larger than kv_head
+        # axis (replicas > kv_size // replicas). Boundary cases
+        # (replicas == kv_size // replicas) are ANNOTATED per fail-safe
+        # direction (wrong skip = silent corruption; wrong apply =
+        # loud JAX error).
+        # Route: empirical predicate — the pinned JAX 0.11.0 shard_map
+        # mesh-nesting check could not be grounded in installed source
+        # (no matching error string in jax/_src/shard_map.py or mesh.py;
+        # nesting error did not reproduce on CPU).
+        if replicas <= kv_size // replicas:
+            new_mesh = jax.sharding.AbstractMesh(
+                mesh.axis_sizes[:i] + (kv_size // replicas, replicas) +
+                mesh.axis_sizes[i + 1:],
+                mesh.axis_names[:i] + (kv_head_axis, replica_axis) +
+                mesh.axis_names[i + 1:],
+                mesh.axis_types[:i] + (kv_type, kv_type) + mesh.axis_types[i + 1:],
+            )
+            if isinstance(head_axis, tuple):
+                in_head_axis = list(head_axis)
+                in_head_axis.insert(
+                    in_head_axis.index(kv_head_axis) + 1, replica_axis)
+            else:
+                in_head_axis = (head_axis, replica_axis)
 
-        with jax.sharding.use_abstract_mesh(new_mesh):
-            k_jax = _mark_kv_head_replicated(k_jax)
-            v_jax = _mark_kv_head_replicated(v_jax)
+            @shard_map(mesh=new_mesh,
+                       in_specs=P(data_axis, in_head_axis),
+                       out_specs=P(data_axis, head_axis),
+                       check_vma=False)
+            def _mark_kv_head_replicated(t):
+                return t
+
+            with jax.sharding.use_abstract_mesh(new_mesh):
+                k_jax = _mark_kv_head_replicated(k_jax)
+                v_jax = _mark_kv_head_replicated(v_jax)
+        # else: replica axis strictly larger than kv_head axis —
+        # known-illegal shape (JAX rejects the nested mesh); skip
+        # annotation to avoid the fatal. LIMITATION: skipping leaves
+        # the _tile_kv duplication undeclared at runtime — the same
+        # sharding-declaration loss that corrupted generation in
+        # 3f2f9036. Correctness on this path is UNVERIFIED; TPU gate
+        # decides.
 
         out_jax = jnp.concatenate([q_jax, k_jax, v_jax], axis=-1)
         return torch_view(out_jax), bias

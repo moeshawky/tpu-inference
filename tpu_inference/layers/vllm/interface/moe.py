@@ -69,6 +69,31 @@ def _bank_gating_device(topk_vals: jax.Array, topk_ids: jax.Array,
     return gating
 
 
+def _footprint_unique_ids(topk_ids_np: np.ndarray,
+                          num_valid_tokens=None) -> np.ndarray:
+    """Unique expert IDs for the S-1 over-footprint check.
+
+    Rows at index >= num_valid_tokens are padding rows. The GMM kernel
+    clamps padding rows to expert 0 downstream (jnp.where over
+    token_valid), so this counts padding rows as expert 0 here. When
+    num_valid_tokens is None or unusable, returns plain unique over the
+    input, matching prior behavior.
+    """
+    if num_valid_tokens is None:
+        return np.unique(topk_ids_np)
+    try:
+        n_valid = int(num_valid_tokens)
+    except Exception:
+        return np.unique(topk_ids_np)
+    if n_valid < 0:
+        return np.unique(topk_ids_np)
+    if n_valid >= topk_ids_np.shape[0]:
+        return np.unique(topk_ids_np)
+    masked = topk_ids_np.copy()
+    masked[n_valid:, :] = 0
+    return np.unique(masked)
+
+
 def select_moe_backend_from_fused_moe_config(
         moe: FusedMoEConfig) -> MoEBackend:
     """
@@ -208,7 +233,22 @@ def vllm_moe_apply(layer: RoutedExperts,
         topk_vals, topk_ids = jax.lax.top_k(jax_view(router_logits), layer.top_k)
         # Export tiny [T,K] int32 IDs for host-side bookkeeping (miss/over-footprint)
         topk_ids_np = np.asarray(jax.device_get(jax_view(topk_ids))).astype(np.int64)
-        unique_ids_np = np.unique(topk_ids_np)
+        # Padding rows are clamped to expert 0 downstream in fused_moe_gmm
+        # (jnp.where(token_valid, topk_indices, 0)), so count padding rows
+        # as expert 0 here; otherwise padding logits inflate the unique
+        # count and force the legacy fallback on every layer.
+        _num_valid_raw = extra_kwargs.get("num_valid_tokens", None)
+        _num_valid_int = None
+        if _num_valid_raw is not None:
+            try:
+                if isinstance(_num_valid_raw, (int, np.integer)):
+                    _num_valid_int = int(_num_valid_raw)
+                else:
+                    _num_valid_int = int(
+                        np.asarray(jax.device_get(_num_valid_raw)).reshape(-1)[0])
+            except Exception:
+                _num_valid_int = None
+        unique_ids_np = _footprint_unique_ids(topk_ids_np, _num_valid_int)
         # Over-footprint: unique experts exceed slot capacity → fallback to legacy wave path
         if len(unique_ids_np) > bank.slots - 1:
             logger.info_once(

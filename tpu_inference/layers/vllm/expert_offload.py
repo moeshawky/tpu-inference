@@ -774,6 +774,34 @@ class _LayerBank:
             self.lru.remove(expert_id)
         self.lru.append(expert_id)
 
+    @staticmethod
+    def _compute_waves(topk_ids_np: np.ndarray, top_k: int,
+                       S: int) -> list[tuple[int, int]]:
+        """Compute wave token ranges where each wave has ≤ S-1 unique experts.
+
+        Greedy in-order packing, identical algorithm to route().
+        Returns list of (start, end) tuples where end is exclusive.
+        """
+        T = topk_ids_np.shape[0]
+        if T == 0:
+            return []
+        per_token_unique = []
+        for t in range(T):
+            top_ids = np.argpartition(topk_ids_np[t], -top_k)[-top_k:]
+            per_token_unique.append(set(int(e) for e in top_ids))
+        waves: list[tuple[int, int]] = []
+        cur_start = 0
+        cur_unique: set[int] = set(per_token_unique[0])
+        for t in range(1, T):
+            if len(cur_unique | per_token_unique[t]) > S - 1:
+                waves.append((cur_start, t))
+                cur_start = t
+                cur_unique = set(per_token_unique[t])
+            else:
+                cur_unique.update(per_token_unique[t])
+        waves.append((cur_start, T))
+        return waves
+
     def slot_weights(self):
         """Current device slot contents: (w13, w2, w13_scale, w2_scale).
 

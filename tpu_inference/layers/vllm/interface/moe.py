@@ -249,29 +249,59 @@ def vllm_moe_apply(layer: RoutedExperts,
             except Exception:
                 _num_valid_int = None
         unique_ids_np = _footprint_unique_ids(topk_ids_np, _num_valid_int)
-        # Over-footprint: unique experts exceed slot capacity → fallback to legacy wave path
+        # Over-footprint: unique experts exceed slot capacity
+        # → device-first wave path (each wave ≤ S-1 unique)
         if len(unique_ids_np) > bank.slots - 1:
             logger.info_once(
-                "[MoE]: %s over-footprint %d unique > S-1=%d, falling back to legacy route()",
+                "[MoE]: %s over-footprint %d unique > S-1=%d, "
+                "using device-first wave path",
                 layer.layer_name, len(unique_ids_np), bank.slots - 1)
-            logits_np = np.asarray(jax.device_get(jax_view(router_logits)))
-            g_np = bank.route(logits_np, layer.top_k)
-            g = jax.device_put(g_np, NamedSharding(mesh, PartitionSpec()))
-            weights = FusedMoEWeights(
-                w13_weight=bank.slot_w13,
-                w13_weight_scale=bank.slot_w13_scale,
-                w13_bias=None,
-                w2_weight=bank.slot_w2,
-                w2_weight_scale=bank.slot_w2_scale,
-                w2_bias=None,
-            )
-            return torch_view(
-                moe_apply(
-                    layer=layer, x=jax_view(x), gating_output=g,
-                    weights=weights, moe_backend=quant_method_instance.moe_backend,
-                    mesh=quant_method_instance.mesh,
-                    extra_backend_kwargs=extra_kwargs,
-                ))
+            # Compute wave assignments from numpy topk_ids
+            waves = bank._compute_waves(topk_ids_np, layer.top_k, bank.slots)
+            # Loop over waves: each wave gets device-first treatment
+            outputs = []
+            for wave_start, wave_end in waves:
+                wave_unique = _footprint_unique_ids(
+                    topk_ids_np[wave_start:wave_end], _num_valid_int)
+                # Ensure residency for this wave's unique experts
+                if len(wave_unique) > 0:
+                    slot_table = jnp.array(bank.slot_to_expert,
+                                           dtype=jnp.int32)
+                    bank.ensure_resident(wave_unique, slot_table=slot_table)
+                    expert_to_slot_jnp = expert_offload._build_expert_to_slot(bank)
+                else:
+                    expert_to_slot_jnp = expert_offload._build_expert_to_slot(bank)
+                # Re-run top_k for this wave's slice
+                router_logits_w = router_logits[wave_start:wave_end]
+                x_w = x[wave_start:wave_end]
+                topk_vals_w, topk_ids_w = jax.lax.top_k(
+                    jax_view(router_logits_w), layer.top_k)
+                topk_ids_w_np = np.asarray(
+                    jax.device_get(jax_view(topk_ids_w))).astype(np.int64)
+                # Device-side scatter gating
+                gating_w = _bank_gating_device(
+                    topk_vals_w, topk_ids_w, expert_to_slot_jnp, bank.slots)
+                # Device-side moe_apply with slot weights
+                weights_w = FusedMoEWeights(
+                    w13_weight=bank.slot_w13,
+                    w13_weight_scale=bank.slot_w13_scale,
+                    w13_bias=None,
+                    w2_weight=bank.slot_w2,
+                    w2_weight_scale=bank.slot_w2_scale,
+                    w2_bias=None,
+                )
+                out_w = torch_view(
+                    moe_apply(
+                        layer=layer, x=jax_view(x_w),
+                        gating_output=gating_w,
+                        weights=weights_w,
+                        moe_backend=quant_method_instance.moe_backend,
+                        mesh=quant_method_instance.mesh,
+                        extra_backend_kwargs=extra_kwargs,
+                    ))
+                outputs.append(out_w)
+            # Concatenate wave outputs along token dimension
+            return torch.cat(outputs, dim=0)
         # Residency check on host
         is_resident = np.all(np.isin(unique_ids_np, bank.slot_to_expert))
         if not is_resident:

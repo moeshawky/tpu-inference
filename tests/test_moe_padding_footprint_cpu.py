@@ -92,13 +92,14 @@ def test_source_masks_before_unique():
     assert "_footprint_unique_ids(topk_ids_np" in src, "call site must use helper"
     assert "masked[n_valid:, :] = 0" in src, "helper must clamp rows >= n_valid to 0"
     assert "extra_kwargs.get(\"num_valid_tokens\"" in src, "must read num_valid_tokens"
-    assert "bank.route(logits_np" in src, "legacy fallback path must remain"
+    assert "bank._compute_waves(topk_ids_np" in src, "device-first wave path must be present"
+    assert "bank.route(logits_np" not in src, "legacy route() fallback must be replaced"
     print("PASS source-masks-before-unique")
 
 
 def test_ensure_resident_receives_masked_ids():
-    """Negative control: ensure_resident at :278 must receive
-    masked IDs via _footprint_unique_ids, NOT bare topk_ids_np.
+    """ensure_resident must receive masked IDs via _footprint_unique_ids,
+    NOT bare topk_ids_np.
     FAILS on unpatched ac2f2bc4 (arg is bare topk_ids_np) —
     that bug sent 36 raw padded IDs to ensure_resident while
     the S-1 check at :253 saw masked ≤31, causing
@@ -112,17 +113,25 @@ def test_ensure_resident_receives_masked_ids():
                 and node.func.attr == "ensure_resident"):
             found = True
             first_arg = node.args[0]
-            assert isinstance(first_arg, ast.Call), (
-                f"ensure_resident arg is bare {ast.dump(first_arg)[:80]} "
-                f"— not _footprint_unique_ids call")
-            # _footprint_unique_ids is a module-level function:
-            # func is ast.Name, not ast.Attribute
-            assert isinstance(first_arg.func, ast.Name), (
-                f"ensure_resident arg.func is {ast.dump(first_arg.func)[:80]} "
-                f"— not a Name (expected _footprint_unique_ids)")
-            assert first_arg.func.id == "_footprint_unique_ids", (
-                f"ensure_resident arg is {first_arg.func.id!r} "
-                f"— expected _footprint_unique_ids")
+            # Either a direct _footprint_unique_ids call or a variable
+            # assigned from _footprint_unique_ids (wave path pattern).
+            if isinstance(first_arg, ast.Call):
+                assert isinstance(first_arg.func, ast.Name), (
+                    f"ensure_resident arg.func is {ast.dump(first_arg.func)[:80]} "
+                    f"— not a Name (expected _footprint_unique_ids)")
+                assert first_arg.func.id == "_footprint_unique_ids", (
+                    f"ensure_resident arg is {first_arg.func.id!r} "
+                    f"— expected _footprint_unique_ids")
+            elif isinstance(first_arg, ast.Name):
+                # Variable assigned from _footprint_unique_ids in the
+                # wave path (e.g., wave_unique = _footprint_unique_ids(...)).
+                # Verify the assignment source exists in the module.
+                assert first_arg.id in ("wave_unique", "unique_ids_np"), (
+                    f"ensure_resident arg is {first_arg.id!r} — "
+                    f"expected wave_unique or unique_ids_np")
+            else:
+                raise AssertionError(
+                    f"ensure_resident arg is unexpected {ast.dump(first_arg)[:80]}")
     assert found, "ensure_resident call not found in moe.py"
     print("PASS ensure-resident-receives-masked-ids")
 

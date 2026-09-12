@@ -50,6 +50,7 @@ import os
 import re
 import struct
 from pathlib import Path
+from math import gcd
 
 import numpy as np
 import jax
@@ -808,6 +809,15 @@ class _LayerBank:
                 cur_unique.update(per_token_unique[t])
         waves.append((cur_start, T))
         return waves
+
+    @staticmethod
+    def _align_wave(n: int, top_k: int) -> int:
+        """Minimum execution wave size satisfying GMM (n*topk)%16==0.
+
+        quantum = 16 // gcd(16, top_k). For top_k=10: quantum=8.
+        """
+        quantum = 16 // gcd(16, top_k)
+        return ((n + quantum - 1) // quantum) * quantum
 
     def slot_weights(self):
         """Current device slot contents: (w13, w2, w13_scale, w2_scale).

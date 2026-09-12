@@ -261,9 +261,17 @@ def vllm_moe_apply(layer: RoutedExperts,
             # Loop over waves: each wave gets device-first treatment
             outputs = []
             for wave_start, wave_end in waves:
+                n = wave_end - wave_start
+                exec_n = bank._align_wave(n, layer.top_k)
+                # Wave-local valid token count (rebased, never global)
+                if _num_valid_int is not None:
+                    wave_valid = max(0, min(wave_end, _num_valid_int) - wave_start)
+                else:
+                    wave_valid = n
+                # Real expert IDs for this wave (padding masked to 0)
                 wave_unique = _footprint_unique_ids(
                     topk_ids_np[wave_start:wave_end], _num_valid_int)
-                # Ensure residency for this wave's unique experts
+                # Ensure residency for REAL wave experts only (before padding)
                 if len(wave_unique) > 0:
                     slot_table = jnp.array(bank.slot_to_expert,
                                            dtype=jnp.int32)
@@ -278,10 +286,19 @@ def vllm_moe_apply(layer: RoutedExperts,
                     jax_view(router_logits_w), layer.top_k)
                 topk_ids_w_np = np.asarray(
                     jax.device_get(jax_view(topk_ids_w))).astype(np.int64)
-                # Device-side scatter gating
-                gating_w = _bank_gating_device(
+                # Device-side scatter gating for REAL rows [n, S]
+                gating_real = _bank_gating_device(
                     topk_vals_w, topk_ids_w, expert_to_slot_jnp, bank.slots)
-                # Device-side moe_apply with slot weights
+                # Build padded hidden_states [exec_n, H] (zeros beyond n)
+                H = jax_view(x_w).shape[-1]
+                hidden_padded = jnp.zeros((exec_n, H), dtype=jax_view(x_w).dtype)
+                hidden_padded = hidden_padded.at[:n].set(jax_view(x_w))
+                # Pad gating to [exec_n, S] with -inf for dummy rows
+                S = gating_real.shape[-1]
+                gating_padded = jnp.full(
+                    (exec_n, S), -jnp.inf, dtype=jnp.float32)
+                gating_padded = gating_padded.at[:n].set(gating_real)
+                # Device-side moe_apply with wave-local num_valid_tokens
                 weights_w = FusedMoEWeights(
                     w13_weight=bank.slot_w13,
                     w13_weight_scale=bank.slot_w13_scale,
@@ -290,16 +307,19 @@ def vllm_moe_apply(layer: RoutedExperts,
                     w2_weight_scale=bank.slot_w2_scale,
                     w2_bias=None,
                 )
+                wave_extra = dict(extra_kwargs)
+                wave_extra["num_valid_tokens"] = wave_valid
                 out_w = torch_view(
                     moe_apply(
-                        layer=layer, x=jax_view(x_w),
-                        gating_output=gating_w,
+                        layer=layer, x=hidden_padded,
+                        gating_output=gating_padded,
                         weights=weights_w,
                         moe_backend=quant_method_instance.moe_backend,
                         mesh=quant_method_instance.mesh,
-                        extra_backend_kwargs=extra_kwargs,
+                        extra_backend_kwargs=wave_extra,
                     ))
-                outputs.append(out_w)
+                # Extract first n rows (dummy rows produce zero output)
+                outputs.append(out_w[:n])
             # Concatenate wave outputs along token dimension
             return torch.cat(outputs, dim=0)
         # Residency check on host

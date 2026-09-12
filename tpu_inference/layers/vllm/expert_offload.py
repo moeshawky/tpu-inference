@@ -787,8 +787,15 @@ class _LayerBank:
             return []
         per_token_unique = []
         for t in range(T):
-            top_ids = np.argpartition(topk_ids_np[t], -top_k)[-top_k:]
+            top_ids = topk_ids_np[t]
             per_token_unique.append(set(int(e) for e in top_ids))
+        if len(per_token_unique[0]) > S - 1:
+            raise RuntimeError(
+                f"[expert-offload] layer None: single token "
+                f"needs {len(per_token_unique[0])} unique experts "
+                f"(top_k={top_k}) but S={S} (available S-1="
+                f"{S - 1} with slot 0 pinned to expert 0). "
+                f"Reduce top_k.")
         waves: list[tuple[int, int]] = []
         cur_start = 0
         cur_unique: set[int] = set(per_token_unique[0])

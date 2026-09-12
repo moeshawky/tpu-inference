@@ -96,9 +96,61 @@ def test_source_masks_before_unique():
     print("PASS source-masks-before-unique")
 
 
+def test_ensure_resident_receives_masked_ids():
+    """Negative control: ensure_resident at :278 must receive
+    masked IDs via _footprint_unique_ids, NOT bare topk_ids_np.
+    FAILS on unpatched ac2f2bc4 (arg is bare topk_ids_np) —
+    that bug sent 36 raw padded IDs to ensure_resident while
+    the S-1 check at :253 saw masked ≤31, causing
+    expert_offload.py:633 RuntimeError."""
+    src = MOE_PATH.read_text()
+    tree = ast.parse(src)
+    found = False
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "ensure_resident"):
+            found = True
+            first_arg = node.args[0]
+            assert isinstance(first_arg, ast.Call), (
+                f"ensure_resident arg is bare {ast.dump(first_arg)[:80]} "
+                f"— not _footprint_unique_ids call")
+            # _footprint_unique_ids is a module-level function:
+            # func is ast.Name, not ast.Attribute
+            assert isinstance(first_arg.func, ast.Name), (
+                f"ensure_resident arg.func is {ast.dump(first_arg.func)[:80]} "
+                f"— not a Name (expected _footprint_unique_ids)")
+            assert first_arg.func.id == "_footprint_unique_ids", (
+                f"ensure_resident arg is {first_arg.func.id!r} "
+                f"— expected _footprint_unique_ids")
+    assert found, "ensure_resident call not found in moe.py"
+    print("PASS ensure-resident-receives-masked-ids")
+
+
+def test_masked_unique_fits_slots():
+    """Positive: T=16/K=8/valid=3/S=32, padding covers 0..31.
+    Masked unique ≤ S-1=31 so ensure_resident receives ≤31
+    unique experts — no RuntimeError at expert_offload.py:633."""
+    fn, _ = _load_footprint_fn()
+    T, K, valid, S = 16, 8, 3, 32
+    topk = np.zeros((T, K), dtype=np.int64)
+    topk[0] = np.array([1, 2, 1, 2, 1, 2, 1, 2])
+    topk[1] = np.array([2, 3, 2, 3, 2, 3, 2, 3])
+    topk[2] = np.array([1, 5, 1, 5, 1, 5, 1, 5])
+    seq = np.arange((T - valid) * K) % 32
+    topk[valid:] = seq.reshape(T - valid, K)
+    masked = fn(topk, valid)
+    assert len(masked) <= S - 1, (
+        f"masked unique {len(masked)} > S-1={S-1}: {masked}")
+    assert 0 in masked, "expert 0 (padding slot) must be in masked set"
+    print("PASS masked-unique-fits-slots")
+
+
 if __name__ == "__main__":
     test_padded_no_fallback()
     test_valid_overflow_triggers()
     test_none_preserves_raw()
     test_source_masks_before_unique()
+    test_ensure_resident_receives_masked_ids()
+    test_masked_unique_fits_slots()
     print("ALL CPU CHECKS PASSED")

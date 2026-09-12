@@ -275,7 +275,10 @@ def vllm_moe_apply(layer: RoutedExperts,
         # Residency check on host
         is_resident = np.all(np.isin(unique_ids_np, bank.slot_to_expert))
         if not is_resident:
-            bank.ensure_resident(topk_ids_np,
+            # Pass masked IDs to ensure_resident: rows >= _num_valid_int
+            # are padding clamped to expert 0 by _footprint_unique_ids
+            # (matches fused_moe_gmm clamp + slot-0 reservation).
+            bank.ensure_resident(_footprint_unique_ids(topk_ids_np, _num_valid_int),
                                   slot_table=jnp.array(bank.slot_to_expert,
                                                         dtype=jnp.int32))
             expert_to_slot_jnp = expert_offload._build_expert_to_slot(bank)

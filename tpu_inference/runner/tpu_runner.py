@@ -1409,13 +1409,19 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self,
         grammar_output: "GrammarOutput | None",
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        # B04-DIAG diagnostic sync — remove before functional fix
+        logger.info("B04 SAMPLE_TOKENS ENTER")
         if self._continue_decode_output is not None:
             output = self._continue_decode_output
             self._continue_decode_output = None
+            # B04-DIAG diagnostic sync — remove before functional fix
+            logger.info("B04 SAMPLE_TOKENS RETURN")
             return output
 
         if self.execute_model_state is None:
             # This can happen in pipeline parallel case.
+            # B04-DIAG diagnostic sync — remove before functional fix
+            logger.info("B04 SAMPLE_TOKENS RETURN")
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         (scheduler_output, attn_metadata, sampling_metadata, input_ids,
@@ -1454,12 +1460,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     logits,
                     arange,
                 )
-            return self._sample_from_logits(
+            logger.info("B04 SAMPLE_TOKENS ENTER")
+            result = self._sample_from_logits(
                 scheduler_output, attn_metadata, sampling_metadata, input_ids,
                 hidden_states, logits, aux_hidden_states, spec_decode_metadata,
                 kv_connector_output, logits_indices_selector, padded_num_reqs,
                 expert_indices, full_hidden_states, full_logits, req_ids_dp,
                 padded_num_scheduled_tokens_per_dp_rank)
+            logger.info("B04 SAMPLE_TOKENS RETURN")
+            return result
 
     def _modify_prev_results(self):
         # If copy to host has not been done, we just wait.
@@ -1789,21 +1798,29 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 else:
                     step_ctx = nullcontext()
                 with step_ctx:
+                    # B04-DIAG diagnostic sync — remove before functional fix
+                    logger.info("B04 MODEL_FN ENTER")
                     (self.kv_caches, hidden_states, aux_hidden_states,
                      expert_indices) = self.model_fn(
-                         self.state_leaves,
-                         self.kv_caches,
-                         input_ids,
-                         attn_metadata,
-                         inputs_embeds,
-                         input_positions,
-                         tuple(self.layer_name_to_kvcache_index.items()),
-                         lora_metadata,
-                         intermediate_tensors,
-                         self.is_first_rank,
-                         self.is_last_rank,
-                         shared_attention_metadata=shared_attn_metadata,
-                     )
+                          self.state_leaves,
+                          self.kv_caches,
+                          input_ids,
+                          attn_metadata,
+                          inputs_embeds,
+                          input_positions,
+                          tuple(self.layer_name_to_kvcache_index.items()),
+                          lora_metadata,
+                          intermediate_tensors,
+                          self.is_first_rank,
+                          self.is_last_rank,
+                          shared_attention_metadata=shared_attn_metadata,
+                      )
+                    # B04-DIAG diagnostic sync — remove before functional fix
+                    logger.info("B04 MODEL_FN RETURN")
+                    # B04-DIAG diagnostic sync — remove before functional fix
+                    if self.is_last_rank and isinstance(hidden_states, jax.Array):
+                        jax.block_until_ready(hidden_states)
+                        logger.info("B04 HIDDEN READY")
             if not self.is_last_rank:
                 assert isinstance(hidden_states, JaxIntermediateTensors)
                 hidden_states.kv_connector_output = kv_connector_output
@@ -1848,25 +1865,43 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         if self.input_batch.num_prompt_logprobs:
             # Compute logits for ALL token positions once.
+            logger.info("B04 LOGITS ENTER")
             full_logits = self.compute_logits_fn(
                 self.state_leaves,
                 full_hidden_states,
                 lora_metadata,
             )
+            logger.info("B04 LOGITS RETURN")
+            jax.block_until_ready(full_logits)
+            logger.info("B04 LOGITS READY")
+            logger.info("B04 SELECT ENTER")
             logits = self._select_from_array_fn(
                 full_logits, logits_indices, self.mesh,
                 self.vllm_config.sharding_config.prefill_cp_size)
+            logger.info("B04 SELECT RETURN")
+            jax.block_until_ready(logits)
+            logger.info("B04 SELECT READY")
         else:
             full_logits = None
+            logger.info("B04 SELECT ENTER")
             hidden_states = self._select_from_array_fn(
                 hidden_states, logits_indices, self.mesh,
                 self.vllm_config.sharding_config.prefill_cp_size)
+            logger.info("B04 SELECT RETURN")
+            jax.block_until_ready(hidden_states)
+            logger.info("B04 SELECT READY")
+            logger.info("B04 LOGITS ENTER")
             logits = self.compute_logits_fn(
                 self.state_leaves,
                 hidden_states,
                 lora_metadata,
             )
+            logger.info("B04 LOGITS RETURN")
+            jax.block_until_ready(logits)
+            logger.info("B04 LOGITS READY")
 
+        # B04-DIAG diagnostic sync — remove before functional fix
+        logger.info("B04 EXEC_STATE SET")
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             attn_metadata=attn_metadata,
@@ -1887,6 +1922,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             padded_num_scheduled_tokens_per_dp_rank=
             padded_num_scheduled_tokens_per_dp_rank,
         )
+        # B04-DIAG diagnostic sync — remove before functional fix
+        logger.info("B04 EXECUTE_MODEL RETURN")
         return None
 
     def _get_min_remaining_slots(self) -> int:
@@ -2139,6 +2176,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         req_ids_dp: Optional[Dict] = None,
         padded_num_scheduled_tokens_per_dp_rank: int = 0,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
+        logger.info("B04 SAMPLE_FROM_LOGITS ENTER")
         if padded_num_reqs is None:
             padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
                 self.input_batch.num_reqs, self.max_num_reqs)
@@ -2371,6 +2409,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 runner=self)
             return async_model_runner_output
 
+        logger.info("B04 SAMPLE_FROM_LOGITS RETURN")
+        logger.info("B04 NEXT_TOKENS DISPATCH")
+        if isinstance(next_tokens, jax.Array):
+            jax.block_until_ready(next_tokens)
+            logger.info("B04 SAMPLE_READY")
+        logger.info("B04 NEXT_TOKENS READY")
+
         valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
             self, spec_decode_metadata, next_tokens, logits_indices_selector,
             discard_sampled_tokens_req_indices, num_reqs)
@@ -2432,6 +2477,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             )
             model_runner_output.routed_experts = routed_experts
 
+        # B04-DIAG diagnostic sync — remove before functional fix
+        logger.info("B04 SAMPLE_FROM_LOGITS RETURN")
         return model_runner_output
 
     @staticmethod

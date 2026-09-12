@@ -260,7 +260,7 @@ def vllm_moe_apply(layer: RoutedExperts,
             waves = bank._compute_waves(topk_ids_np, layer.top_k, bank.slots)
             # Loop over waves: each wave gets device-first treatment
             outputs = []
-            for wave_start, wave_end in waves:
+            for i, (wave_start, wave_end) in enumerate(waves):
                 n = wave_end - wave_start
                 exec_n = bank._align_wave(n, layer.top_k)
                 # Wave-local valid token count (rebased, never global)
@@ -269,6 +269,7 @@ def vllm_moe_apply(layer: RoutedExperts,
                 else:
                     wave_valid = n
                 # Real expert IDs for this wave (padding masked to 0)
+                # B04-DIAG audit note: B03 VALIDITY-DOMAIN BUG: CONFIRMED — wave_valid=max(0,min(wave_end,global_valid)-wave_start) computed correctly but _footprint_unique_ids(topk_ids_np[wave_start:wave_end], _num_valid_int) uses GLOBAL _num_valid_int not wave_valid, and _compute_waves(topk_ids_np,...) receives raw physical rows incl. beyond-valid rows. Future fix: pass wave_valid to _footprint_unique_ids and feed _compute_waves with valid-only rows.
                 wave_unique = _footprint_unique_ids(
                     topk_ids_np[wave_start:wave_end], _num_valid_int)
                 # Ensure residency for REAL wave experts only (before padding)
@@ -309,6 +310,7 @@ def vllm_moe_apply(layer: RoutedExperts,
                 )
                 wave_extra = dict(extra_kwargs)
                 wave_extra["num_valid_tokens"] = wave_valid
+                logger.info(f"B04 WAVE DISPATCH ENTER layer={layer.layer_name} wave={i}")
                 out_w = torch_view(
                     moe_apply(
                         layer=layer, x=hidden_padded,
@@ -318,10 +320,16 @@ def vllm_moe_apply(layer: RoutedExperts,
                         mesh=quant_method_instance.mesh,
                         extra_backend_kwargs=wave_extra,
                     ))
+                jax.block_until_ready(jax_view(out_w))
+                logger.info(f"B04 WAVE READY layer={layer.layer_name} wave={i}")
                 # Extract first n rows (dummy rows produce zero output)
                 outputs.append(out_w[:n])
-            # Concatenate wave outputs along token dimension
-            return torch.cat(outputs, dim=0)
+            logger.info(f"B04 MOE CAT ENTER layer={layer.layer_name}")
+            moe_cat_out = torch.cat(outputs, dim=0)
+            logger.info(f"B04 MOE CAT RETURN layer={layer.layer_name}")
+            jax.block_until_ready(jax_view(moe_cat_out))
+            logger.info(f"B04 MOE CAT READY layer={layer.layer_name}")
+            return moe_cat_out
         # Residency check on host
         is_resident = np.all(np.isin(unique_ids_np, bank.slot_to_expert))
         if not is_resident:

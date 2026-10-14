@@ -295,7 +295,7 @@ class TPUWorker(WorkerBase):
 
         visible_chips = ",".join(str(c) for c in range(start_chip, end_chip))
         # Unique libtpu port per rank so the runtimes can coexist on a host.
-        tpu_port = jax_parallel_state.BASE_JAX_PORT + dp_rank
+        tpu_port = jax_parallel_state.BASE_TPU_PROCESS_PORT + dp_rank
 
         os.environ["TPU_VISIBLE_CHIPS"] = visible_chips
         os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] = f"1,{chips_per_rank},1"
@@ -344,7 +344,7 @@ class TPUWorker(WorkerBase):
             else:
                 # Single host PP logic
                 tpu_ports = [
-                    jax_parallel_state.BASE_JAX_PORT + i
+                    jax_parallel_state.BASE_TPU_PROCESS_PORT + i
                     for i in range(self.pp_config.pp_world_size)
                 ]
                 os.environ["TPU_PROCESS_ADDRESSES"] = ",".join(
@@ -698,6 +698,11 @@ class TPUWorker(WorkerBase):
         # and the vLLM side should be updated to handle the translation.
         return self.model_runner.get_kv_cache_spec()
 
+    def get_mamba_num_blocks(self) -> int | None:
+        """Rows in the mamba state pool this worker allocated (None without
+        mamba layers). Read by the engine core over `collective_rpc`."""
+        return self.model_runner.kv_cache_manager.actual_mamba_num_blocks
+
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
         # NOTE: we are not using it right now.
@@ -738,6 +743,7 @@ class TPUWorker(WorkerBase):
         self.bind_raiden_sync(
             worker_index=init_info.get("worker_index", 0),
             parallelism=init_info.get("parallelism", 4),
+            job_name=init_info.get("job_name", "rollout"),
         )
 
     def start_weight_update(self, free_kv_cache: bool = True) -> None:
@@ -807,7 +813,8 @@ class TPUWorker(WorkerBase):
 
     def bind_raiden_sync(self,
                          worker_index: int = 0,
-                         parallelism: int = 4) -> dict:
+                         parallelism: int = 4,
+                         job_name: str = "rollout") -> dict:
         """Binds this worker's live weights to Raiden and returns wire-safe
         registration metadata (never the arrays)."""
         from tpu_inference.rl import \
@@ -816,24 +823,39 @@ class TPUWorker(WorkerBase):
         state = self.get_weights_state()
         if self._raiden_rl_weight_sync is None:
             self._raiden_rl_weight_sync = raiden_worker_sync.RaidenWorkerSync(
-                job_name="rollout",
+                job_name=job_name,
                 worker_index=worker_index,
                 parallelism=parallelism,
             )
+        else:
+            # Re-bind: the transport is reused, but the caller may have moved
+            # this worker to a different Raiden job (per-replica job names), and
+            # metadata_dict() would otherwise re-register under the stale one.
+            self._raiden_rl_weight_sync.job_name = job_name
+            self._raiden_rl_weight_sync.worker_index = worker_index
         self._raiden_rl_weight_sync.bind(state)
         return self._raiden_rl_weight_sync.metadata_dict()
+
+    def refresh_model_state_leaves(self) -> None:
+        """Re-points the runner's dispatch view at the freshly synced weights.
+
+        `model_fn` takes `state_leaves` as its first argument; it is derived
+        from `state` at load time and goes stale once the weights behind
+        `state` are replaced.
+        """
+        self.model_runner.refresh_state_leaves()
 
     def get_raiden_metadata(self) -> dict:
         """Re-fetches the current binding's wire-safe metadata without rebinding."""
         return self._require_raiden_sync("get_raiden_metadata").metadata_dict()
 
-    def raiden_h2d(self) -> dict:
+    def raiden_h2d(self, uuid: Optional[int] = None) -> dict:
         """Blocks until the transfer that just landed is visible on-device.
 
         Returns tensor checksums when `VERIFY_WEIGHTS=true`.
         """
         sync = self._require_raiden_sync("raiden_h2d")
-        sync.h2d()
+        sync.h2d(uuid=uuid)
         if envs.VERIFY_WEIGHTS:
             return sync.checksums()
         return {}

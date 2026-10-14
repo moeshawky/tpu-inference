@@ -319,6 +319,9 @@ def _ragged_paged_attention_kernel_loop(
     bkv_update_ids_ref,  # [6 or 8] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz) (bkv_smem_0_src_start_base, bkv_smem_1_src_start_base)
     cp_rank_ref: jax.Array | None,  # i32[1]
     q_pos_offset_ref: jax.Array | None,  # i32[max_num_seqs]
+    kv_new_starts_ref: jax.Array | None,  # i32[max_num_seqs]
+    kv_write_seq_mask_ref: jax.Array | None,  # i32[max_num_seqs]
+    kv_page_order_ref: jax.Array | None,  # i32[kv_buffer_tokens // page_size]
     # Input
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
@@ -349,7 +352,6 @@ def _ragged_paged_attention_kernel_loop(
     cp_group_size: int | None = None,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
-    write_last_seq_only: bool = False,
     skip_kv_mask: bool = False,
     skip_cache_attn: bool = False,
     skip_current_attn: bool = False,
@@ -361,7 +363,6 @@ def _ragged_paged_attention_kernel_loop(
     k_scale: float | None = None,
     v_scale: float | None = None,
     static_q_len: int | None = None,
-    pcp_chunk_size: int | None = None,
     bq_sz,  # bq fetch size
     bkv_sz,  # bkv prefetch size
     bq_csz,  # bq compute size
@@ -437,7 +438,11 @@ def _ragged_paged_attention_kernel_loop(
         return cu_q_lens_ref[seq_idx + 1] - cu_q_lens_ref[seq_idx]
 
     def get_kv_new_end(seq_idx):
+        # End of this seq's block inside the new-KV buffer (a read offset into
+        # kv_hbm_ref); under PCP kv_new_starts gives each seq's base.
         if kv_cache_lens_ref is not None:
+            if kv_new_starts_ref is not None:
+                return kv_new_starts_ref[seq_idx] + get_kv_new_len(seq_idx)
             return get_kv_new_len(seq_idx)
         return cu_q_lens_ref[seq_idx + 1]
 
@@ -758,24 +763,41 @@ def _ragged_paged_attention_kernel_loop(
             # Fetch new kvs.
             if not skip_current_attn:
                 new_kv_len_start = _seq_kv_new_end - kv_left_frm_new
-                if pcp_chunk_size is not None:
-                    two_p = 2 * cp_group_size
-                    chunk_idx = new_kv_len_start // pcp_chunk_size
-                    offset_in_chunk = (new_kv_len_start -
-                                       chunk_idx * pcp_chunk_size)
-                    rank_slot = jnp.where(chunk_idx < cp_group_size,
-                                          2 * chunk_idx,
-                                          2 * (two_p - 1 - chunk_idx) + 1)
-                    new_kv_len_start = (rank_slot * pcp_chunk_size +
-                                        offset_in_chunk)
                 debug_print("[RPA debug] new_kv_len_start={}",
                             new_kv_len_start)
-                _async_copy(
-                    kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                    vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
-                    sem,
-                    wait,
-                )
+                if kv_page_order_ref is not None:
+                    # PCP: the new-KV buffer is still in all_gather rank
+                    # order; kv_page_order maps each token-order page to the
+                    # page holding it there (contiguous, since every zigzag
+                    # chunk is a whole number of pages). At most bkv_p + 1
+                    # pieces, first and last possibly partial; they sum to
+                    # bkv_sz_frm_new, so the single wait below still
+                    # accounts for every byte.
+                    num_map_pages = kv_page_order_ref.shape[0]
+                    first_page = new_kv_len_start // page_size
+                    head_skip = new_kv_len_start % page_size
+                    for i in range(bkv_p + 1):
+                        src_in_page = head_skip if i == 0 else 0
+                        dst_off = (0 if i == 0 else i * page_size - head_skip)
+                        sz = jnp.clip(bkv_sz_frm_new - dst_off, 0,
+                                      page_size - src_in_page)
+                        page_idx = jnp.minimum(first_page + i,
+                                               num_map_pages - 1)
+                        _async_copy(
+                            kv_hbm_ref.at[pl.ds(
+                                kv_page_order_ref[page_idx] * page_size +
+                                src_in_page, sz)],
+                            vmem_ref.at[pl.ds(bkv_sz_frm_cache + dst_off, sz)],
+                            sem,
+                            wait=False,
+                        )
+                else:
+                    _async_copy(
+                        kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+                        vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
+                        sem,
+                        wait,
+                    )
         else:
             fetch_sz = 0
             if not skip_cache_attn:
@@ -1383,10 +1405,11 @@ def _ragged_paged_attention_kernel_loop(
                     # PCP fuses a request's head+tail chunks into ONE launch as
                     # two "sequences" that share the same request (same
                     # kv_lens/kv_cache_lens), so each would write the SAME
-                    # strided current KV. Write on exactly one of them.
-                    if write_last_seq_only:
-                        _do_write = jnp.logical_and(_do_write,
-                                                    seq_idx == end_seq_idx - 1)
+                    # strided current KV. Write on exactly one of them --
+                    # kv_write_seq_mask marks which (each request's tail).
+                    if kv_write_seq_mask_ref is not None:
+                        _do_write = jnp.logical_and(
+                            _do_write, kv_write_seq_mask_ref[seq_idx] != 0)
 
                     @pl.when(_do_write)
                     def update_cur_bkv_to_cache():
@@ -1806,6 +1829,9 @@ def static_validate_inputs(
     *,
     kv_cache_lens: jax.Array | None = None,  # i32[max_num_seqs] - PCP
     q_pos_offsets: jax.Array | None = None,  # i32[max_num_seqs] - PCP
+    kv_new_starts: jax.Array | None = None,  # i32[max_num_seqs] - PCP
+    kv_write_seq_mask: jax.Array | None = None,  # i32[max_num_seqs] - PCP
+    kv_page_order: jax.Array | None = None,  # i32[kv_tokens // page_size]
     cp_group_size: int | None = None,
     cp_rank: jax.Array | int | None = None,
     pcp_ring_axis_name: str | None = None,
@@ -1993,6 +2019,38 @@ def static_validate_inputs(
             raise NotImplementedError(
                 "pcp_ring_axis_name does not support sliding_window")
 
+    for name, arr in (("kv_new_starts", kv_new_starts), ("kv_write_seq_mask",
+                                                         kv_write_seq_mask)):
+        if arr is None:
+            continue
+        if arr.dtype != jnp.int32:
+            raise ValueError(
+                f"Expected int32 dtype for {name}, got {arr.dtype}")
+        if arr.shape != (max_num_seqs, ):
+            raise ValueError(
+                f"Expected {name}.shape to be ({max_num_seqs},), got {arr.shape}"
+            )
+
+    if kv_new_starts is not None:
+        if kv_cache_lens is None:
+            raise ValueError("PCP (kv_new_starts) requires kv_cache_lens.")
+
+    if kv_page_order is not None:
+        if kv_cache_lens is None or cp_group_size is None:
+            raise ValueError("PCP (kv_page_order) requires kv_cache_lens and "
+                             "cp_group_size.")
+        if kv_page_order.dtype != jnp.int32:
+            raise ValueError(f"Expected int32 dtype for kv_page_order, got "
+                             f"{kv_page_order.dtype}")
+        if k.shape[0] % page_size != 0:
+            raise ValueError(
+                f"PCP (kv_page_order) needs the new-KV buffer rows "
+                f"{k.shape[0]} to be a multiple of {page_size=}.")
+        if kv_page_order.shape != (k.shape[0] // page_size, ):
+            raise ValueError(
+                f"Expected kv_page_order.shape to be "
+                f"({k.shape[0] // page_size},), got {kv_page_order.shape}")
+
     # No constraints for the following inputs.
     del sm_scale
     del mask_value
@@ -2014,7 +2072,6 @@ def get_default_block_sizes(
     pages_per_seq,
     *,
     case: RpaCase = RpaCase.MIXED,
-    pcp_chunk_size: int | None = None,
     pcp_ring: bool = False,
     vmem_limit_bytes: int | None = None,
 ):
@@ -2086,17 +2143,6 @@ def get_default_block_sizes(
         "bkv_csz": align_to(bkv_csz, page_size),
     }
 
-    # PCP current phase (rank-ordered KV remap) needs the prefetch block to
-    # stay within one head-tail chunk of size C, i.e. bkv_sz <= C.
-    if pcp_chunk_size is not None and case == RpaCase.MIXED:
-        bkv_sz = min(bs["bkv_sz"], pcp_chunk_size)
-        while bkv_sz > page_size and pcp_chunk_size % bkv_sz != 0:
-            bkv_sz -= page_size
-        bkv_csz = min(bs["bkv_csz"], bkv_sz)
-        while bkv_csz > page_size and bkv_sz % bkv_csz != 0:
-            bkv_csz -= page_size
-        bs = {**bs, "bkv_sz": bkv_sz, "bkv_csz": bkv_csz}
-
     if pcp_ring and case == RpaCase.MIXED:
         # Ring sizing is the opposite of the default heuristic.  The default
         # picks small Q tiles because re-streaming KV per tile is nearly free
@@ -2152,9 +2198,7 @@ def get_default_block_sizes(
         "disable_bounds_checks",
         "disable_semaphore_checks",
         "update_kv_cache",
-        "write_last_seq_only",
         "cp_group_size",
-        "pcp_chunk_size",
         "pcp_ring_axis_name",
         "pcp_ring_mesh_axis_names",
     ),
@@ -2178,12 +2222,13 @@ def ragged_paged_attention(
     | None = None,  # i32[1] - per-device rank, sharded along the DCP axis
     cp_group_size: int | None = None,
     q_pos_offsets: jax.Array | None = None,  # i32[max_num_seqs]
-    pcp_chunk_size: int | None = None,
+    kv_new_starts: jax.Array | None = None,  # i32[max_num_seqs]
+    kv_write_seq_mask: jax.Array | None = None,  # i32[max_num_seqs]
+    kv_page_order: jax.Array | None = None,  # i32[kv_tokens // page_size]
     pcp_ring_axis_name: str | None = None,
     pcp_ring_mesh_axis_names: tuple[str, ...] | None = None,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
-    write_last_seq_only: bool = False,
     skip_kv_mask: bool = False,
     skip_cache_attn: bool = False,
     skip_current_attn: bool = False,
@@ -2235,12 +2280,24 @@ def ragged_paged_attention(
       KV cache around this axis.
     pcp_ring_mesh_axis_names: all axis names of the mesh the ring runs on, in
       order. Defaults to a one-axis mesh.
-    use_causal_mask: if true, use causal mask.
-    write_last_seq_only: PCP only. PCP fuses a request's head and tail chunk
-      into one launch as two "sequences" that are really the same request (same
+    kv_new_starts: PCP only. Base offset of each sequence's current-KV block
+      inside the all-gathered new-KV buffer (`keys`/`values`), which packs the
+      requests back to back in request order (a single request's block starts
+      at 0); leave None for the non-PCP paths.
+    kv_write_seq_mask: PCP only. Nonzero on the sequences that perform the fused
+      strided KV-cache write. PCP fuses a request's head and tail chunk into one
+      launch as two "sequences" that are really the same request (same
       kv_lens/kv_cache_lens), so each of them would redundantly write the same
-      strided current KV to the cache. When true, the write is performed by the
-      tail seq only.
+      strided current KV; the mask selects exactly one per request (its tail).
+      Leave None to let every sequence write, as in the non-PCP path.
+    kv_page_order: PCP only. Per-page indirection map for the new-KV buffer
+      (`keys`/`values`): entry j is the page of that buffer holding token-order
+      page j. Lets the kernel fetch current K/V straight from the rank-order
+      all_gather result, page by page like the paged cache, instead of needing
+      the buffer pre-gathered into token order. Requires every zigzag chunk to
+      be a whole number of pages. Leave None when the buffer is already in
+      token order.
+    use_causal_mask: if true, use causal mask.
     skip_kv_mask: only set to true if use_causal_mask=False and each dynamic
       kv_len % bkv_csz == 0. Set to true can improve performance.
     sm_scale: the softmax scale which will be applied to the Q@K^T.
@@ -2295,6 +2352,9 @@ def ragged_paged_attention(
         distribution,
         kv_cache_lens=kv_cache_lens,
         q_pos_offsets=q_pos_offsets,
+        kv_new_starts=kv_new_starts,
+        kv_write_seq_mask=kv_write_seq_mask,
+        kv_page_order=kv_page_order,
         cp_group_size=cp_group_size,
         cp_rank=cp_rank,
         pcp_ring_axis_name=pcp_ring_axis_name,
@@ -2453,7 +2513,10 @@ def ragged_paged_attention(
             init_bo_ids,
             init_bkv_update_ids,
             cp_rank if cp_group_size is not None else None,
-            q_pos_offsets)
+            q_pos_offsets,
+            kv_new_starts,
+            kv_write_seq_mask,
+            kv_page_order)
 
         num_scalers = len(scalar_prefetches)
         # None in scalar_prefetches contribute 0 pytree leaves, so
@@ -2497,7 +2560,6 @@ def ragged_paged_attention(
                 cp_group_size=cp_group_size,
                 pcp_ring_axis_name=pcp_ring_axis_name,
                 pcp_ring_mesh_axis_names=pcp_ring_mesh_axis_names,
-                write_last_seq_only=write_last_seq_only,
                 use_causal_mask=use_causal_mask,
                 skip_kv_mask=skip_kv_mask,
                 skip_cache_attn=skip_cache_attn,
@@ -2510,7 +2572,6 @@ def ragged_paged_attention(
                 k_scale=k_scale,
                 v_scale=v_scale,
                 static_q_len=static_q_len,
-                pcp_chunk_size=pcp_chunk_size,
                 bq_sz=bq_sz,
                 bkv_sz=bkv_sz,
                 bq_csz=bq_csz,
@@ -2579,7 +2640,6 @@ def ragged_paged_attention(
                 max_num_seqs,
                 pages_per_seq,
                 case=case,
-                pcp_chunk_size=pcp_chunk_size,
                 pcp_ring=pcp_ring_axis_name is not None,
                 vmem_limit_bytes=vmem_limit_bytes,
             )

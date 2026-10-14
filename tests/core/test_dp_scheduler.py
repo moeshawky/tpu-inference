@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from vllm.config import VllmConfig
+from vllm.distributed.aux_output_connector.connector import (
+    AuxOutputConnectorMetadata, AuxRequestOutput)
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -55,6 +57,7 @@ class TestDPScheduler:
         config.cache_config = MagicMock()
         config.cache_config.enable_prefix_caching = False
         config.cache_config.prefix_caching_hash_algo = "sha256"
+        config.cache_config.mamba_num_blocks = None
         return config
 
     @pytest.fixture
@@ -129,6 +132,41 @@ class TestDPScheduler:
                 # Verify processes were started
                 mock_process = mock_ctx.Process.return_value
                 assert mock_process.start.call_count == 2
+
+    def test_init_with_mamba_num_blocks_per_rank(
+        self,
+        mock_vllm_config,
+        mock_kv_cache_config,
+        mock_structured_output_manager,
+    ):
+        """Test that mamba_num_blocks is partitioned per DP rank from cache_config."""
+        mock_vllm_config.cache_config.mamba_num_blocks = 60
+        scheduler = self._create_scheduler(
+            mock_vllm_config,
+            mock_kv_cache_config,
+            mock_structured_output_manager,
+        )
+        assert len(scheduler.per_rank_kv_cache_configs) == 2
+        for rank_config in scheduler.per_rank_kv_cache_configs:
+            assert rank_config.num_blocks == 50
+            assert rank_config.mamba_num_blocks == 30
+
+    def test_init_without_mamba_num_blocks(
+        self,
+        mock_vllm_config,
+        mock_kv_cache_config,
+        mock_structured_output_manager,
+    ):
+        """Test that rank configs have no mamba_num_blocks if not configured."""
+        scheduler = self._create_scheduler(
+            mock_vllm_config,
+            mock_kv_cache_config,
+            mock_structured_output_manager,
+        )
+        assert len(scheduler.per_rank_kv_cache_configs) == 2
+        for rank_config in scheduler.per_rank_kv_cache_configs:
+            assert rank_config.num_blocks == 50
+            assert getattr(rank_config, "mamba_num_blocks", None) is None
 
     def test_init_with_prefix_caching_enabled(
         self,
@@ -399,6 +437,32 @@ class TestDPScheduler:
         scheduler._get_result.assert_called_with(1,
                                                  SchedulerCommand.ADD_REQUEST)
 
+    def test_round_robin_routing_skips_rank_queries(
+            self, mock_vllm_config, mock_kv_cache_config,
+            mock_structured_output_manager):
+        """round_robin assigns ranks cyclically without querying rank state."""
+        scheduler = self._create_scheduler(mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager)
+        scheduler._routing_policy = DPScheduler.RoutingPolicy.ROUND_ROBIN
+        scheduler._batch_prefills = False
+        scheduler._send_command = MagicMock()
+        scheduler._get_result = MagicMock(return_value=None)
+        scheduler._find_best_rank_for_request = MagicMock(
+            side_effect=AssertionError("must not query rank state"))
+
+        requests = []
+        for i in range(5):
+            req = MagicMock(spec=Request)
+            req.request_id = f"req-{i}"
+            requests.append(req)
+            scheduler.add_request(req)
+
+        assert [scheduler.assigned_dp_rank[r.request_id]
+                for r in requests] == [0, 1, 0, 1, 0]
+        sent = [c.args[1] for c in scheduler._send_command.call_args_list]
+        assert sent == [SchedulerCommand.ADD_REQUEST] * 5
+
     def test_schedule_sends_commands_and_combines_output(
             self, mock_vllm_config, mock_kv_cache_config,
             mock_structured_output_manager):
@@ -425,6 +489,7 @@ class TestDPScheduler:
         mock_output_0.scheduled_spec_decode_tokens = {}
         mock_output_0.scheduled_encoder_inputs = {}
         mock_output_0.num_common_prefix_blocks = []
+        mock_output_0.aux_output_connector_metadata = None
 
         mock_output_1 = MagicMock(spec=SchedulerOutput)
         mock_output_1.scheduled_new_reqs = []
@@ -443,6 +508,7 @@ class TestDPScheduler:
         mock_output_1.scheduled_spec_decode_tokens = {}
         mock_output_1.scheduled_encoder_inputs = {}
         mock_output_1.num_common_prefix_blocks = []
+        mock_output_1.aux_output_connector_metadata = None
 
         # Mock _send_command and _collect_results_unordered
         scheduler._send_command = MagicMock()
@@ -495,6 +561,7 @@ class TestDPScheduler:
         mock_output_0.scheduled_spec_decode_tokens = {}
         mock_output_0.scheduled_encoder_inputs = {}
         mock_output_0.num_common_prefix_blocks = []
+        mock_output_0.aux_output_connector_metadata = None
 
         mock_output_1 = MagicMock(spec=SchedulerOutput)
         mock_output_1.scheduled_new_reqs = []
@@ -513,6 +580,7 @@ class TestDPScheduler:
         mock_output_1.scheduled_spec_decode_tokens = {}
         mock_output_1.scheduled_encoder_inputs = {}
         mock_output_1.num_common_prefix_blocks = []
+        mock_output_1.aux_output_connector_metadata = None
 
         scheduler._send_command = MagicMock()
         scheduler._collect_results_unordered = MagicMock(
@@ -833,6 +901,41 @@ class TestDPScheduler:
         stats = scheduler.make_stats()
         assert stats is None
 
+    def test_log_dp_rank_balance(self, mock_vllm_config, mock_kv_cache_config,
+                                 mock_structured_output_manager):
+        """Test _log_dp_rank_balance logs rank breakdown and respects log interval."""
+        scheduler = self._create_scheduler(mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager,
+                                           log_stats=True)
+
+        stats_0 = SchedulerStats(num_running_reqs=2,
+                                 num_waiting_reqs=1,
+                                 kv_cache_usage=0.2)
+        stats_1 = SchedulerStats(num_running_reqs=4,
+                                 num_waiting_reqs=0,
+                                 kv_cache_usage=0.6)
+
+        with patch(
+                "tpu_inference.core.sched.dp_scheduler.logger") as mock_logger:
+            # First call should log info because running reqs > 0
+            scheduler._log_dp_rank_balance([stats_0, stats_1], 6, 1)
+            mock_logger.info.assert_called_once()
+            args = mock_logger.info.call_args[0]
+            assert "[DP Rank Balance]" in args[0]
+            assert args[1] == [2, 4]
+            assert args[2] == 6
+            assert args[3] == 2
+            assert args[4] == 4
+            assert args[5] == [1, 0]
+            assert args[6] == 1
+            assert args[7] == "20.0%, 60.0%"
+
+            mock_logger.reset_mock()
+            # Immediate second call within interval should be throttled
+            scheduler._log_dp_rank_balance([stats_0, stats_1], 6, 1)
+            mock_logger.info.assert_not_called()
+
     def test_update_draft_token_ids(self, mock_vllm_config,
                                     mock_kv_cache_config,
                                     mock_structured_output_manager):
@@ -914,6 +1017,17 @@ class TestDPScheduler:
         output_1.has_structured_output_requests = False
         output_1.pending_structured_output_tokens = True
 
+        output_0.aux_output_connector_metadata = AuxOutputConnectorMetadata(
+            generation=1,
+            requests={"req1": 9},
+            block_hashes={},
+            finished_requests=("old0", ))
+        output_1.aux_output_connector_metadata = AuxOutputConnectorMetadata(
+            generation=1,
+            requests={"req2": 19},
+            block_hashes={},
+            finished_requests=("old1", ))
+
         combined = scheduler._combine_scheduler_outputs([output_0, output_1])
 
         assert combined.total_num_scheduled_tokens == 30
@@ -922,6 +1036,11 @@ class TestDPScheduler:
         assert combined.req_ids_per_rank == {0: ["req1"], 1: ["req2"]}
         assert combined.has_structured_output_requests is True
         assert combined.pending_structured_output_tokens is True
+
+        aux_meta = combined.aux_output_connector_metadata
+        assert aux_meta.generation == 1
+        assert aux_meta.requests == {"req1": 9, "req2": 19}
+        assert aux_meta.finished_requests == ("old0", "old1")
 
     def test_split_model_output_by_rank(self, mock_vllm_config,
                                         mock_kv_cache_config,
@@ -980,6 +1099,10 @@ class TestDPScheduler:
             pooler_output=None,
             num_nans_in_logits=None,
             kv_connector_output=MagicMock(),
+            aux_output_connector_output={
+                "req1": AuxRequestOutput(0, np.zeros((5, 2, 2))),
+                "req2": AuxRequestOutput(4, np.zeros((1, 2, 2))),
+            },
         )
 
         outputs = scheduler._split_model_output_by_rank(
@@ -991,12 +1114,19 @@ class TestDPScheduler:
         assert outputs[0].req_ids == ["req1", "req3"]
         assert outputs[0].req_id_to_index == {"req1": 0, "req3": 1}
         assert outputs[0].sampled_token_ids == [[42], [77]]
+        # req3 emitted no routed experts this step.
+        assert outputs[0].aux_output_connector_output == {
+            "req1": model_runner_output.aux_output_connector_output["req1"]
+        }
 
         # Rank 1 should have req2
         assert outputs[1].req_ids == ["req2"]
         assert outputs[1].req_id_to_index == {"req2": 0}
         assert outputs[1].sampled_token_ids == [[99]]
         assert "req2" in outputs[1].prompt_logprobs_dict
+        assert outputs[1].aux_output_connector_output == {
+            "req2": model_runner_output.aux_output_connector_output["req2"]
+        }
 
     def test_split_model_output_by_rank_with_logprobs(
             self, mock_vllm_config, mock_kv_cache_config,

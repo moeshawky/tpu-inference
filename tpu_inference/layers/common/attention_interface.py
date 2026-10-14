@@ -404,6 +404,26 @@ def sharded_splash_attention(
         ))
 
 
+def rpa_block_size_kwargs() -> dict[str, tuple[int, int, int, int]]:
+    """Optional RPA v3 block-size overrides from env, for the call site to
+    forward with ``**``.
+
+    The kernel is self-contained and never reads env, so every call site must
+    supply these (the vLLM-model path in layers/jax/attention/attention.py and
+    the MaxText path below). Without it the RPA_V3_*_BLOCK_SIZES vars are
+    silently ignored and the kernel falls back to get_default_block_sizes().
+    Each var is a comma-separated 4-tuple ``(bq_sz, bkv_sz, bq_csz, bkv_csz)``;
+    a key is included only when its var is non-empty, so the default call is
+    unchanged.
+    """
+    env_to_kwarg = {
+        "d_block_sizes": envs.RPA_V3_DECODE_BLOCK_SIZES,
+        "p_block_sizes": envs.RPA_V3_PREFILL_BLOCK_SIZES,
+        "m_block_sizes": envs.RPA_V3_MIXED_BLOCK_SIZES,
+    }
+    return {k: tuple(v) for k, v in env_to_kwarg.items() if v}
+
+
 def sharded_ragged_paged_attention(
     mesh: Mesh,
     q: jax.Array,
@@ -477,6 +497,11 @@ def sharded_ragged_paged_attention(
             "update_kv_cache=False (KV-share) is not supported on the "
             "head_dim==64 RPA kernel.")
 
+    if use_hd64 and not use_causal_mask:
+        raise NotImplementedError(
+            "Bidirectional attention is not supported on the head_dim==64 "
+            "RPA kernel")
+
     def _ragged_paged_attention(*args):
         kwargs = dict(
             sm_scale=sm_scale,
@@ -494,6 +519,10 @@ def sharded_ragged_paged_attention(
             kwargs["use_causal_mask"] = use_causal_mask
             if envs.USE_BATCHED_RPA_KERNEL:
                 kwargs["decode_query_size"] = decode_query_size
+            else:
+                # RPA_V3_*_BLOCK_SIZES are v3-kernel knobs; the experimental
+                # batched kernel takes its own BlockSizes configs instead.
+                kwargs.update(rpa_block_size_kwargs())
         return func(*args, **kwargs)
 
     return jax.shard_map(
@@ -520,7 +549,7 @@ def attention(
     v_scale: float | None = None,
     sinks: jax.Array | None = None,
     update_kv_cache: bool = True,
-    use_causal_mask: bool = True,
+    use_causal_mask: bool | None = None,
     shared_attention_metadata: SharedAttentionMetadata | None = None,
     attn_logits_soft_cap: float | None = None,
     decode_query_size: int = 1,
@@ -544,10 +573,15 @@ def attention(
         sm_scale = head_dim_original**-0.5
 
     md = attention_metadata
+    if use_causal_mask is None:
+        use_causal_mask = md.use_causal_mask
     # shared_attention_metadata is None for flax models, and is used for vllm models to share the metadata across layers.
     shared_md = shared_attention_metadata if shared_attention_metadata is not None else md
 
     if 'dcp' in mesh.shape and mesh.shape['dcp'] > 1:
+        if not use_causal_mask:
+            raise NotImplementedError(
+                "Bidirectional attention is not supported with DCP")
         return dcp_forward(
             mesh,
             q,

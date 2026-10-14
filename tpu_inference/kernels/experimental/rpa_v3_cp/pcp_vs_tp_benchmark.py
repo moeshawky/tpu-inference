@@ -163,6 +163,7 @@ def _run_variant(mp, variant, chunk, max_ctx, kv_dtype_name, page, slack,
     from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
                                                       ShardingAxisName,
                                                       ShardingAxisNameBase)
+    from tpu_inference.runner.pcp_utils import pcp_page_order, pcp_seq_arrays
 
     # The N-D axis names carry `pcp`; select them regardless of
     # NEW_MODEL_DESIGN so the benchmark does not depend on the env.
@@ -276,7 +277,7 @@ def _run_variant(mp, variant, chunk, max_ctx, kv_dtype_name, page, slack,
                       for a in MESH_AXIS_NAMES)
         mesh = Mesh(
             np.array(jax.devices()[:pcp * tp]).reshape(shape), MESH_AXIS_NAMES)
-        two_p, C = 2 * pcp, chunk // (2 * pcp)
+        C = chunk // (2 * pcp)
         # KV_CONTEXT shards the page dim: a global page holds page*pcp tokens.
         gpage = page * pcp
         pages_per_seq = max(cdiv(max_ctx, gpage), 1)
@@ -306,27 +307,25 @@ def _run_variant(mp, variant, chunk, max_ctx, kv_dtype_name, page, slack,
             (MAX_SEQ * pages_per_seq, ),
             jnp.int32).at[:2 * pages_per_seq].set(jnp.concatenate([pg, pg]))
         dist = jnp.array([0, 0, 2], jnp.int32)
-        pcp_cu = np.zeros((pcp, MAX_SEQ + 1), np.int32)
-        pcp_qp = np.zeros((pcp, MAX_SEQ), np.int32)
-        for r in range(pcp):
-            toff = (two_p - 1 - r) * C
-            treal = int(np.clip(chunk - toff, 0, C))
-            pcp_cu[r, 1] = C
-            pcp_cu[r, 2:] = C + treal
-            pcp_qp[r, 0] = r * C
-            pcp_qp[r, 1] = toff
+        # The production per-seq arrays for one request of 2P*C rows.
+        cu_row, qp_np, kvs_np = pcp_seq_arrays([C], [0], pcp, MAX_SEQ)
         pcp_spec = P(ShardingAxisName.PREFILL_CONTEXT, None)
-        pcp_cu = put(jnp.asarray(pcp_cu), pcp_spec)
-        pcp_qp = put(jnp.asarray(pcp_qp), pcp_spec)
+        pcp_cu = put(jnp.asarray(np.tile(cu_row, (pcp, 1))), pcp_spec)
+        pcp_qp = put(jnp.asarray(qp_np), pcp_spec)
+        assert C % page == 0, (C, page)
+        kv_starts = put(jnp.asarray(kvs_np), P())
+        kv_pages = put(
+            jnp.asarray(
+                pcp_page_order([C], [0], pcp, chunk // pcp, chunk, page)), P())
         fns = {}
 
-        def fn_for(cache_pages):
-            # `cache_pages` is static metadata (one program per bucket), as in
-            # the runner.
-            if cache_pages not in fns:
+        def fn_for(has_cached_kv):
+            # `has_cached_kv` is static metadata (one program per value), as
+            # in the runner.
+            if has_cached_kv not in fns:
 
                 @functools.partial(jax.jit, donate_argnums=(0, ))
-                def fn(cache, q, k, v, kvl, kvcl, _cp=cache_pages):
+                def fn(cache, q, k, v, kvl, kvcl, _hc=has_cached_kv):
                     md = AttentionMetadata(
                         input_positions=jnp.zeros(1, jnp.int32),
                         seq_lens=kvl,
@@ -335,7 +334,9 @@ def _run_variant(mp, variant, chunk, max_ctx, kv_dtype_name, page, slack,
                         pcp=PCPMetadata(query_start_loc=pcp_cu,
                                         kv_cache_lens=kvcl,
                                         q_pos_offsets=pcp_qp,
-                                        cache_pages=_cp),
+                                        kv_new_starts=kv_starts,
+                                        kv_page_order=kv_pages,
+                                        has_cached_kv=_hc),
                     )
                     cache, out = pcp_forward(mesh,
                                              q,
@@ -357,16 +358,8 @@ def _run_variant(mp, variant, chunk, max_ctx, kv_dtype_name, page, slack,
                                         check_vma=False)(out)
                     return out, cache
 
-                fns[cache_pages] = fn
-            return fns[cache_pages]
-
-        def cache_pages_for(ctx):
-            # Mirror the runner: live page count rounded up to a power of two.
-            computed = ctx - chunk
-            if computed <= 0:
-                return 0
-            live = cdiv(computed, gpage)
-            return min(1 << max(live - 1, 0).bit_length(), npages)
+                fns[has_cached_kv] = fn
+            return fns[has_cached_kv]
 
         def measure(ctx):
             kvl = jnp.zeros((MAX_SEQ, ), jnp.int32).at[:2].set(ctx)
@@ -374,8 +367,7 @@ def _run_variant(mp, variant, chunk, max_ctx, kv_dtype_name, page, slack,
                              jnp.int32).at[:2].set(max(ctx - chunk, 0))
             cache = jax.device_put(jnp.zeros(cache_shape, kv_dtype),
                                    NamedSharding(mesh, cache_spec))
-            return bench_cache(fn_for(cache_pages_for(ctx)), cache, q, k, v,
-                               kvl, kvcl)
+            return bench_cache(fn_for(ctx > chunk), cache, q, k, v, kvl, kvcl)
 
         return measure
 

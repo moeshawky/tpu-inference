@@ -102,6 +102,17 @@ class TestTpuPlatform:
         assert "MOE_STAGE_WEIGHTS_ON_HOST" in TpuPlatform.additional_env_vars
         assert "MOE_STAGE_WEIGHTS_ON_HOST" in envs.environment_variables
 
+    def test_additional_env_vars_covers_moe_hierarchical_dispatch(self):
+        """The dispatch gather is traced in the workers, so they must see the
+        flag."""
+        assert "MOE_HIERARCHICAL_DISPATCH" in TpuPlatform.additional_env_vars
+        assert "MOE_HIERARCHICAL_DISPATCH" in envs.environment_variables
+
+    def test_additional_env_vars_covers_moe_hierarchical_collect(self):
+        """The collect is traced in the workers, so they must see the flag."""
+        assert "MOE_HIERARCHICAL_COLLECT" in TpuPlatform.additional_env_vars
+        assert "MOE_HIERARCHICAL_COLLECT" in envs.environment_variables
+
     def test_get_device_total_memory(self):
         with pytest.raises(NotImplementedError):
             TpuPlatform.get_device_total_memory()
@@ -256,9 +267,14 @@ class TestTpuPlatform:
     @patch(
         "tpu_inference.core.sched.dp_scheduler.update_vllm_config_for_dp_scheduler"
     )
+    # The real patch rewrites vLLM's Scheduler for the rest of the pytest
+    # process; tests/core/test_sched_utils.py then applies it a second time.
+    @patch(
+        "tpu_inference.core.sched.utils.patch_vllm_scheduler_for_continue_decode"
+    )
     def test_check_and_update_config_hybrid_prefix_caching(
-            self, mock_update, mock_sharding, vllm_config, is_hybrid,
-            unsupported, expected_prefix_caching):
+            self, mock_continue_decode_patch, mock_update, mock_sharding,
+            vllm_config, is_hybrid, unsupported, expected_prefix_caching):
         """Hybrid (mamba/linear-attention) models keep prefix caching.
 
         Their recurrent state is addressed by block id in
@@ -299,6 +315,33 @@ class TestTpuPlatform:
             # --enable-prefix-caching" validator rejects the config.
             assert vllm_config.cache_config.mamba_cache_mode == "none"
             assert vllm_config.cache_config.mamba_block_size == 4096
+
+    @patch("tpu_inference.platforms.tpu_platform.envs.TPU_MULTIHOST_BACKEND",
+           "")
+    @patch("tpu_inference.platforms.tpu_platform.ShardingConfigManager")
+    @patch(
+        "tpu_inference.core.sched.dp_scheduler.update_vllm_config_for_dp_scheduler"
+    )
+    def test_check_and_update_config_rejects_mamba_cache_mode_all(
+            self, mock_update, mock_sharding, vllm_config):
+        """'all' keeps a state per block of the sequence, not per request.
+
+        The TPU pool is sized for resident state only, so accepting 'all'
+        would hand out block ids past the end of each layer's array -- which
+        JAX clips silently instead of raising. Fail at config time instead.
+        """
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.scheduler_config.is_multimodal_model = False
+        vllm_config.compilation_config.mode = "dummy"
+        vllm_config.compilation_config.backend = ""
+        vllm_config.model_config.is_hybrid = True
+        vllm_config.cache_config.enable_prefix_caching = True
+        vllm_config.cache_config.mamba_cache_mode = "all"
+        vllm_config.speculative_config = None
+
+        with pytest.raises(NotImplementedError,
+                           match="'all' is not supported on TPU"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @patch("tpu_inference.platforms.tpu_platform.envs.TPU_MULTIHOST_BACKEND",
            "")
@@ -486,7 +529,7 @@ class TestTpuPlatform:
             torch.bfloat16, torch.float32)
         mock_backend.get_supported_kernel_block_sizes.return_value = [256]
 
-        with patch.object(TpuPlatform, '_find_non_ssm_backend', return_value=mock_backend), \
+        with patch.object(TpuPlatform, '_find_non_ssm_backends', return_value=[mock_backend]), \
              patch('vllm.model_executor.models.ModelRegistry.resolve_model_cls', return_value=(mock_backend, MagicMock())), \
              patch("tpu_inference.envs.USE_BATCHED_RPA_KERNEL", enable_batch_rpa):
             TpuPlatform.update_block_size_for_backend(vllm_config)
@@ -815,3 +858,55 @@ class TestTorchAcceleratorGetMemoryInfoShim:
                           return_value=(1, 2)) as orig:
             assert torch.accelerator.get_memory_info(0) == (1, 2)
             orig.assert_called_once_with(0)
+
+
+class TestDisableUniprocStartupThreadCap:
+    """vllm#58946 startup thread cap is disabled for the TPU UniProc path."""
+
+    def _fake_engine_utils(self, monkeypatch, with_helper=True):
+        import contextlib
+        import sys
+        import types
+        fake = types.ModuleType("vllm.v1.engine.utils")
+        calls = []
+        if with_helper:
+
+            @contextlib.contextmanager
+            def _orig(executor_class, local_engine_count):
+                calls.append((executor_class, local_engine_count))
+                yield
+
+            fake._configure_uniproc_startup_threads = _orig
+        monkeypatch.setitem(sys.modules, "vllm.v1.engine.utils", fake)
+        return fake, calls
+
+    def test_replaces_vllm_helper_with_noop(self, monkeypatch):
+        import tpu_inference.platforms.tpu_platform as tpu_platform
+        fake, calls = self._fake_engine_utils(monkeypatch)
+
+        tpu_platform._disable_uniproc_startup_thread_cap()
+
+        assert (fake._configure_uniproc_startup_threads
+                is tpu_platform._no_uniproc_startup_threads)
+        threads = torch.get_num_threads()
+        with fake._configure_uniproc_startup_threads(object, 1):
+            assert torch.get_num_threads() == threads
+        assert calls == []
+
+    def test_is_idempotent(self, monkeypatch):
+        import tpu_inference.platforms.tpu_platform as tpu_platform
+        fake, _ = self._fake_engine_utils(monkeypatch)
+
+        tpu_platform._disable_uniproc_startup_thread_cap()
+        tpu_platform._disable_uniproc_startup_thread_cap()
+
+        assert (fake._configure_uniproc_startup_threads
+                is tpu_platform._no_uniproc_startup_threads)
+
+    def test_noop_when_vllm_has_no_helper(self, monkeypatch):
+        import tpu_inference.platforms.tpu_platform as tpu_platform
+        fake, _ = self._fake_engine_utils(monkeypatch, with_helper=False)
+
+        tpu_platform._disable_uniproc_startup_thread_cap()
+
+        assert not hasattr(fake, "_configure_uniproc_startup_threads")

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest import mock
+
 # /home/pooyam/tpu_inference/tests/models/jax/layers/test_sampling.py
 import jax
 import jax.numpy as jnp
@@ -20,17 +22,111 @@ from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from vllm.v1.outputs import LogprobsTensors
 
+from tpu_inference import envs
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.jax.sample.sampling import (PromptLogprobsAsyncData,
-                                                      PromptLogprobsReqSnap,
-                                                      compute_logprobs,
-                                                      compute_prompt_logprobs,
-                                                      gather_logprobs, sample)
+from tpu_inference.layers.jax.sample.sampling import (
+    PromptLogprobsAsyncData, PromptLogprobsReqSnap, _apply_sampling_transforms,
+    _can_sample_distributed, _merge_topk_candidates, compute_logprobs,
+    compute_prompt_logprobs, distributed_sampling_allowed, gather_logprobs,
+    sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 
 
 class TestSampling:
+
+    @staticmethod
+    def test_distributed_sampling_allowed():
+        assert distributed_sampling_allowed(False, "processed_logprobs")
+        assert distributed_sampling_allowed(True, "raw_logprobs")
+        assert distributed_sampling_allowed(True, "raw_logits")
+        assert not distributed_sampling_allowed(True, "processed_logprobs")
+        assert not distributed_sampling_allowed(True, "processed_logits")
+
+    def test_distributed_sampling_requires_positive_top_p(self):
+        metadata = TPUSupportedSamplingMetadata(
+            temperature=jnp.array([0.7, 0.7], dtype=jnp.float32),
+            top_k=jnp.array([20, 20], dtype=jnp.int32),
+            top_p=jnp.array([0.9, 0.0], dtype=jnp.float32),
+            do_sampling=True,
+            logprobs=False,
+        )
+        assert not bool(_can_sample_distributed(metadata))
+
+        greedy_metadata = TPUSupportedSamplingMetadata(
+            temperature=jnp.array([0.7, 0.0], dtype=jnp.float32),
+            top_k=metadata.top_k,
+            top_p=metadata.top_p,
+            do_sampling=True,
+            logprobs=False,
+        )
+        assert bool(_can_sample_distributed(greedy_metadata))
+
+    def test_distributed_candidates_match_full_vocab_filters(self):
+        batch_size = 2
+        num_shards = 8
+        shard_vocab_size = 256
+        vocab_size = num_shards * shard_vocab_size
+        logits = jax.random.normal(jax.random.key(7), (batch_size, vocab_size),
+                                   dtype=jnp.float32)
+        temperature = jnp.array([1.0, 0.7], dtype=jnp.float32)
+        top_p = jnp.array([0.95, 0.8], dtype=jnp.float32)
+        metadata = TPUSupportedSamplingMetadata(
+            temperature=temperature,
+            top_k=jnp.array([20, 64], dtype=jnp.int32),
+            top_p=top_p,
+            do_sampling=True,
+            logprobs=False,
+        )
+        expected = _apply_sampling_transforms(logits, metadata)
+
+        scaled = logits / temperature[:, None]
+        sharded = scaled.reshape(batch_size, num_shards, shard_vocab_size)
+        local_values, local_ids = jax.lax.top_k(sharded, 128)
+        shard_offsets = (jnp.arange(num_shards, dtype=jnp.int32) *
+                         shard_vocab_size)
+        local_ids += shard_offsets[None, :, None]
+        candidate_values = local_values.reshape(batch_size, -1)
+        candidate_ids = local_ids.reshape(batch_size, -1)
+        filtered_values, filtered_ids, incomplete = (_merge_topk_candidates(
+            candidate_values, candidate_ids, metadata.top_k, top_p))
+
+        actual = jnp.full_like(expected, -1e12)
+        actual = actual.at[jnp.arange(batch_size)[:, None],
+                           filtered_ids].set(filtered_values)
+        assert not np.asarray(incomplete).any()
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_distributed_candidates_preserve_topk_boundary_tie(self):
+        candidate_values = jnp.linspace(1.0, 0.0, 256,
+                                        dtype=jnp.float32)[None, :]
+        candidate_values = candidate_values.at[0, 64].set(candidate_values[0,
+                                                                           63])
+        candidate_ids = jnp.arange(256, dtype=jnp.int32)[None, :]
+        filtered, _, incomplete = _merge_topk_candidates(
+            candidate_values,
+            candidate_ids,
+            jnp.array([64], dtype=jnp.int32),
+            jnp.array([1.0], dtype=jnp.float32),
+        )
+        assert not bool(incomplete[0])
+        assert int(jnp.sum(filtered[0] > -1e11)) >= 65
+
+    def test_distributed_candidates_detect_truncated_tie_group(self):
+        candidate_values = jnp.concatenate((jnp.full(
+            (128, ),
+            10.0, dtype=jnp.float32), jnp.arange(0,
+                                                 -128,
+                                                 -1,
+                                                 dtype=jnp.float32)))[None, :]
+        candidate_ids = jnp.arange(256, dtype=jnp.int32)[None, :]
+        _, _, incomplete = _merge_topk_candidates(
+            candidate_values,
+            candidate_ids,
+            jnp.array([64], dtype=jnp.int32),
+            jnp.array([0.95], dtype=jnp.float32),
+        )
+        assert bool(incomplete[0])
 
     def test_compute_logprobs(self):
         logits = jnp.array([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]],
@@ -165,8 +261,10 @@ class TestProcessedLogprobs:
         raw_logprobs = compute_logprobs(logits)
 
         metadata = self._make_sampling_metadata(1, temperature=0.5)
-        _, processed_logits = sample(jax.random.PRNGKey(0),
-                                     self._get_fake_mesh(), logits, metadata)
+        with mock.patch.object(envs, "SAMPLING_MICROBATCH_SIZE", 16):
+            _, processed_logits = sample(jax.random.PRNGKey(0),
+                                         self._get_fake_mesh(), logits,
+                                         metadata)
         processed = compute_logprobs(processed_logits)
 
         # With temperature < 1, processed logprobs should be more peaked
@@ -199,8 +297,10 @@ class TestProcessedLogprobs:
         logits = jnp.array([[1.0, 5.0, 3.0, 2.0, 4.0]], dtype=jnp.float32)
 
         metadata = self._make_sampling_metadata(1, temperature=1.0, top_k=2)
-        _, processed_logits = sample(jax.random.PRNGKey(0),
-                                     self._get_fake_mesh(), logits, metadata)
+        with mock.patch.object(envs, "SAMPLING_MICROBATCH_SIZE", 16):
+            _, processed_logits = sample(jax.random.PRNGKey(0),
+                                         self._get_fake_mesh(), logits,
+                                         metadata)
         processed = compute_logprobs(processed_logits)
 
         # Top-2 tokens are indices 1 (5.0) and 4 (4.0).
@@ -219,8 +319,10 @@ class TestProcessedLogprobs:
         logits = jnp.array([[10.0, 1.0, 0.0, -1.0]], dtype=jnp.float32)
 
         metadata = self._make_sampling_metadata(1, temperature=1.0, top_p=0.5)
-        _, processed_logits = sample(jax.random.PRNGKey(0),
-                                     self._get_fake_mesh(), logits, metadata)
+        with mock.patch.object(envs, "SAMPLING_MICROBATCH_SIZE", 16):
+            _, processed_logits = sample(jax.random.PRNGKey(0),
+                                         self._get_fake_mesh(), logits,
+                                         metadata)
         processed = compute_logprobs(processed_logits)
 
         # Token 0 has very high probability and should remain.
@@ -236,11 +338,49 @@ class TestProcessedLogprobs:
 
         # Temperature < _SAMPLING_EPS (1e-5)
         metadata = self._make_sampling_metadata(1, temperature=1e-7)
-        _, processed_logits = sample(jax.random.PRNGKey(0),
-                                     self._get_fake_mesh(), logits, metadata)
+        with mock.patch.object(envs, "SAMPLING_MICROBATCH_SIZE", 16):
+            _, processed_logits = sample(jax.random.PRNGKey(0),
+                                         self._get_fake_mesh(), logits,
+                                         metadata)
         processed = compute_logprobs(processed_logits)
 
         assert np.allclose(raw_logprobs, processed, atol=1e-6)
+
+    def test_sampling_transforms_microbatch_preserves_results(self):
+        """A batch of 32 should match two independent batches of 16."""
+        batch_size = 32
+        logits = jnp.arange(batch_size * 64,
+                            dtype=jnp.float32).reshape(batch_size, 64)
+        logits = (logits % 37) / 10.0
+        metadata = TPUSupportedSamplingMetadata(
+            temperature=jnp.linspace(0.5, 1.5, batch_size),
+            top_k=jnp.arange(batch_size, dtype=jnp.int32) % 8 + 1,
+            top_p=jnp.linspace(0.6, 0.95, batch_size),
+            do_sampling=True,
+            logprobs=True,
+        )
+
+        with mock.patch.object(envs, "SAMPLING_MICROBATCH_SIZE", 16):
+            _, processed_logits = sample(jax.random.PRNGKey(0),
+                                         self._get_fake_mesh(), logits,
+                                         metadata)
+
+        chunk_results = []
+        for start in (0, 16):
+            chunk_metadata = TPUSupportedSamplingMetadata(
+                temperature=metadata.temperature[start:start + 16],
+                top_k=metadata.top_k[start:start + 16],
+                top_p=metadata.top_p[start:start + 16],
+                do_sampling=True,
+                logprobs=True,
+            )
+            _, chunk_logits = sample(jax.random.PRNGKey(0),
+                                     self._get_fake_mesh(),
+                                     logits[start:start + 16], chunk_metadata)
+            chunk_results.append(chunk_logits)
+
+        assert np.array_equal(processed_logits,
+                              jnp.concatenate(chunk_results, axis=0))
 
 
 class TestComputePromptLogprobs:
@@ -255,14 +395,14 @@ class TestComputePromptLogprobs:
             [0.0, 0.0, 1.0],
         ],
                                 dtype=jnp.float32)
-        input_ids = jnp.array([0, 1, 2], dtype=jnp.int32)
-
         num_prompt_logprobs = {"req1": 2}
 
         # Mock CachedRequestState and VllmSchedulerOutput
         mock_req_state = MagicMock()
         mock_req_state.num_computed_tokens = 0
         mock_req_state.num_prompt_tokens = 3
+        # Targets are read from here.
+        mock_req_state.prompt_token_ids = [0, 1, 2]
         requests = {"req1": mock_req_state}
 
         mock_scheduler_output = MagicMock()
@@ -271,17 +411,18 @@ class TestComputePromptLogprobs:
         req_ids_dp = {0: ["req1"]}
         dp_size = 1
 
-        res = compute_prompt_logprobs(
-            full_logits=full_logits,
-            input_ids=input_ids,
-            num_prompt_logprobs=num_prompt_logprobs,
-            requests=requests,
-            scheduler_output=mock_scheduler_output,
-            req_ids_dp=req_ids_dp,
-            dp_size=dp_size,
-            max_logprobs=2,
-        )
+        with jax.set_mesh(TestProcessedLogprobs._get_fake_mesh()):
+            res = compute_prompt_logprobs(
+                full_logits=full_logits,
+                num_prompt_logprobs=num_prompt_logprobs,
+                requests=requests,
+                scheduler_output=mock_scheduler_output,
+                req_ids_dp=req_ids_dp,
+                dp_size=dp_size,
+                max_logprobs=2,
+            )
 
+        assert res.tensors.logprobs.sharding.is_fully_replicated
         assert res is not None
         assert isinstance(res, PromptLogprobsAsyncData)
         assert len(res.req_snaps) == 1
@@ -292,3 +433,42 @@ class TestComputePromptLogprobs:
         assert snap.start_idx == 0
         assert snap.num_logits == 2
         assert snap.is_last_chunk is False
+
+
+def test_prompt_targets_do_not_cross_a_chunk_boundary():
+    """A boundary row must not look ahead into the request packed after it.
+
+    Two requests back to back. The first is mid-prompt, so every row of its
+    chunk is scored, including the last one -- whose target is the next token
+    of its own prompt, not the first token of the second request.
+    """
+    from unittest.mock import MagicMock
+
+    from tpu_inference.layers.jax.sample.sampling import (
+        PromptLogprobsReqSnap, _build_prompt_target_ids)
+
+    def snap(offset, start_idx, num_logits, prompt_token_ids):
+        st = MagicMock()
+        st.prompt_token_ids = prompt_token_ids
+        return PromptLogprobsReqSnap(req_id="r",
+                                     req_state=st,
+                                     req_offset=offset,
+                                     start_idx=start_idx,
+                                     num_logits=num_logits,
+                                     is_last_chunk=False,
+                                     num_k=1)
+
+    # req A: prompt [10..17], first chunk of 4 rows at offset 0.
+    # req B: prompt [90..93], 2 rows at offset 4.
+    a = list(range(10, 18))
+    b = list(range(90, 94))
+    targets = np.asarray(
+        _build_prompt_target_ids(
+            8, [snap(0, 0, 4, a), snap(4, 0, 2, b)]))
+
+    # Row 3 is the chunk boundary: its target is A's token 4, never B's first.
+    assert targets[:4].tolist() == [11, 12, 13, 14]
+    assert targets[3] != b[0]
+    assert targets[4:6].tolist() == [91, 92]
+    # Rows no request claims stay 0 and are never read back.
+    assert targets[6:].tolist() == [0, 0]

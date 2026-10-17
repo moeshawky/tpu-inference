@@ -31,8 +31,7 @@ from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.attention.backends.utils import (get_kv_cache_layout,
-                                              set_kv_cache_layout)
+from vllm.v1.attention.backends.utils import set_kv_cache_layout
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec, MambaSpec,
                                         MLAAttentionSpec, SlidingWindowSpec)

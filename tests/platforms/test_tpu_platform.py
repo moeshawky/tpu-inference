@@ -113,6 +113,13 @@ class TestTpuPlatform:
         assert "MOE_HIERARCHICAL_COLLECT" in TpuPlatform.additional_env_vars
         assert "MOE_HIERARCHICAL_COLLECT" in envs.environment_variables
 
+    def test_additional_env_vars_covers_moe_fold_routing(self):
+        """The dispatch gather is traced in the workers, so they must see the
+        flag."""
+        assert ("MOE_FOLD_ROUTING_INTO_DISPATCH"
+                in TpuPlatform.additional_env_vars)
+        assert "MOE_FOLD_ROUTING_INTO_DISPATCH" in envs.environment_variables
+
     def test_get_device_total_memory(self):
         with pytest.raises(NotImplementedError):
             TpuPlatform.get_device_total_memory()
@@ -910,3 +917,32 @@ class TestDisableUniprocStartupThreadCap:
         tpu_platform._disable_uniproc_startup_thread_cap()
 
         assert not hasattr(fake, "_configure_uniproc_startup_threads")
+
+
+class TestEnvOverrideSamplingParamsCircularImport:
+    """`from vllm import SamplingParams` in a fresh process loads
+    `vllm.sampling_params`, which imports `vllm.config` -> `current_platform`
+    -> `tpu_inference.env_override` before `SamplingParams` is defined on
+    `vllm.sampling_params`. `env_override` must not raise `AttributeError`
+    (which `from vllm.platforms import current_platform` turns into
+    `ImportError: cannot import name 'current_platform'`)."""
+
+    def test_partially_initialized_sampling_params_does_not_raise(
+            self, monkeypatch):
+        import importlib
+        import sys
+        import types
+
+        import tpu_inference.env_override as env_override
+
+        fake_vllm = types.ModuleType("vllm")
+        partial_sampling_params = types.ModuleType("vllm.sampling_params")
+        fake_vllm.sampling_params = partial_sampling_params
+
+        monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+        monkeypatch.setitem(sys.modules, "vllm.sampling_params",
+                            partial_sampling_params)
+
+        # Should not raise AttributeError when SamplingParams is not yet
+        # defined on vllm.sampling_params.
+        importlib.reload(env_override)

@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     MOE_ROUTE_PADDING_TO_EXPERT0: bool = False
     MOE_HIERARCHICAL_DISPATCH: bool = False
     MOE_HIERARCHICAL_COLLECT: bool = False
+    MOE_FOLD_ROUTING_INTO_DISPATCH: bool = False
     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
     RAGGED_GATHER_TRIM_ROWS: bool = True
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
@@ -118,6 +119,7 @@ if TYPE_CHECKING:
     # checkpoint on miss. Not implemented in the Design D branch; selecting
     # it while the store is disabled fails loudly at registration.
     MOE_EXPERT_OFFLOAD_RAW_JIT: bool = False
+    TPU_MESH_ATTN_DP_RING: bool = False
     VERIFY_WEIGHTS: bool = False
     SAMPLING_MICROBATCH_SIZE: int = 0
     DISTRIBUTED_SAMPLING_MAX_TOP_K: int = 64
@@ -574,6 +576,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # USE_GMM_FUSED_RS_KERNEL. See fused_moe_gmm.py.
     "MOE_HIERARCHICAL_COLLECT":
     env_bool("MOE_HIERARCHICAL_COLLECT", default=False),
+    # When attention-data axes beyond MLP-data are sharded, carry the MoE
+    # top-k ids and weights as extra columns of the dispatch all-gather of the
+    # tokens (one-step or hierarchical, bf16 or fp8) instead of all-gathering
+    # them separately. Bitwise identical for non-NaN weights. See
+    # fused_moe_gmm.py.
+    "MOE_FOLD_ROUTING_INTO_DISPATCH":
+    env_bool("MOE_FOLD_ROUTING_INTO_DISPATCH", default=False),
     # EP dispatch permute gather: the ragged_gather_v2 kernel
     # (kernels/sparse_core/ragged_gather_v2.py), called from fused_moe_gmm.py.
     # max_row_subchunks: caps the SparseCore gather's block size; 1 gives the
@@ -635,6 +644,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("MOE_EXPERT_OFFLOAD_HOT_CACHE_GIB", "0")),
     "MOE_EXPERT_OFFLOAD_RAW_JIT":
     env_bool("MOE_EXPERT_OFFLOAD_RAW_JIT", default=False),
+    # Lay out an attn_dp x `model=4` mesh on a 2x2xZ v7x slice so that each
+    # attn_dp group is a physical ring of linked chips and each model group is
+    # the two cores of two linked chips. The default layout puts consecutive
+    # attn_dp ranks on unlinked chips, which doubles the load on the busiest
+    # link for attn_dp all-gathers and reduce-scatters. Single slice only;
+    # other meshes fall back to the regular layout. Takes precedence over
+    # TPU_MESH_SORT_BY_COORDS. On more than one host, each host's devices are
+    # no longer a contiguous block of the mesh, so jax's Mesh.local_mesh
+    # fails. See attn_dp_ring_device_mesh in utils.py.
+    "TPU_MESH_ATTN_DP_RING":
+    env_bool("TPU_MESH_ATTN_DP_RING", default=False),
     # Controls whether FP8 linear and MoE layers perform incremental weight
     # loading, sharding, and immediate host RAM cleanup. When enabled, weights
     # are sharded and transferred to TPU device memory layer-by-layer (or per

@@ -82,6 +82,8 @@ if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "synchronize"):
 from vllm.platforms.interface import Platform, PlatformEnum
 
 from tpu_inference import envs
+from tpu_inference.layers.common.attention_backend import (
+    check_attention_backend_config, is_registered_attention_backend)
 from tpu_inference.layers.common.sharding import ShardingConfigManager
 from tpu_inference.logger import init_logger
 
@@ -204,6 +206,7 @@ class TpuPlatform(Platform):
         "PHASED_PROFILING_DIR",
         "MOE_HIERARCHICAL_DISPATCH",
         "MOE_HIERARCHICAL_COLLECT",
+        "MOE_FOLD_ROUTING_INTO_DISPATCH",
         "RAGGED_GATHER_MAX_ROW_SUBCHUNKS",
         "RAGGED_GATHER_TRIM_ROWS",
         "TPU_CHIPS_PER_HOST_BOUNDS",
@@ -223,6 +226,7 @@ class TpuPlatform(Platform):
         "USE_GMM_FUSED_RS_KERNEL",
         "MOE_ALL_GATHER_ACTIVATION_DTYPE",
         "SKIP_MAMBA_SCHEDULER_BLOCKS",
+        "TPU_MESH_ATTN_DP_RING",
     ]
 
     @classmethod
@@ -233,7 +237,16 @@ class TpuPlatform(Platform):
 
         use_mla = attn_selector_config.use_mla
         if use_mla:
+            # MLA layers do not run a registered backend.
+            if is_registered_attention_backend(selected_backend):
+                raise ValueError(
+                    f"--attention-backend {selected_backend.name.lower()} "
+                    "does not support MLA models.")
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
+        elif is_registered_attention_backend(selected_backend):
+            # A registered TPU backend; its name resolves to its own vLLM
+            # attention backend class.
+            pass
         elif selected_backend != AttentionBackendEnum.FLASH_ATTN:
             logger.info("Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
                         selected_backend)
@@ -458,6 +471,8 @@ class TpuPlatform(Platform):
                             min_page_size,
                         )
                         cache_config.block_size = min_page_size  # type: ignore[assignment]
+
+        check_attention_backend_config(vllm_config)
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config

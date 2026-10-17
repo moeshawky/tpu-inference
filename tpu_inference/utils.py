@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import itertools
 import time
 from collections import defaultdict
 from collections.abc import Sequence
@@ -23,7 +24,6 @@ from torchax.ops.mappings import t2j_dtype
 from vllm import envs as vllm_envs
 from vllm import utils
 
-from tpu_inference import envs
 from tpu_inference.layers.common.utils import general_device_put
 from tpu_inference.logger import init_logger
 
@@ -185,36 +185,65 @@ def get_num_kv_heads_by_tp(num_kv_heads: int, tp_size: int) -> int:
         return tp_size
 
 
+def _local_memory_stats(device: Any) -> Optional[Tuple[int, int]]:
+    """Returns (bytes_in_use, bytes_limit) for an addressable device, or None
+    if the runtime does not report memory stats for it."""
+    try:
+        stats = device.memory_stats()
+        return stats["bytes_in_use"], stats["bytes_limit"]
+    except Exception as e:
+        logger.warning("Failed to get memory stats for device %s: %s", device,
+                       e)
+        return None
+
+
 def hbm_usage_bytes(devices: Any) -> List[Tuple[int, int]]:
-    usage = []
+    """Returns (bytes_in_use, bytes_limit) for each device in `devices`.
+
+    Only the given devices are counted. Callers pass the worker's own devices,
+    which on a single host may be a subset of jax.local_devices() (e.g. TP=4 on
+    an 8-device host); counting the whole host would over-size the KV cache.
+
+    memory_stats() is only supported for addressable (this-process) devices.
+    On multi-host (Ray or native jax.distributed) remote devices reuse a local
+    device's stats, assuming all devices have similar usage. If no device
+    reports stats, usage falls back to live-array accounting with the
+    device-kind HBM limit instead of an empty list, which would budget 0 bytes.
+    Live arrays only cover addressable shards, so the same rule applies there:
+    remote devices reuse a local device's estimate instead of reading 0 used.
+    """
+    devices = list(devices)
     if vllm_envs.VLLM_TPU_USING_PATHWAYS:
         return pathways_hbm_usage_gb(devices)
+    if not devices:
+        return []
 
-    multihost_backend = envs.TPU_MULTIHOST_BACKEND
-    if multihost_backend == "ray":
-        # MemoryStats is only supported for addressable PjRt devices.
-        # Assume all the devices have similar memory usage for now.
-        # TODO(ranlihao): find a proper way to get the memory usage of each device.
-        for device in devices:
-            try:
-                hbm_used = device.memory_stats()["bytes_in_use"]
-                hbm_limit = device.memory_stats()["bytes_limit"]
-                logger.info(
-                    "Get memory stats for device %s. Assuming all devices have the same usage.",
-                    device)
-                usage.extend([(hbm_used, hbm_limit)] * len(devices))
-                break
-            except Exception as e:
-                logger.warning(
-                    "Failed to get memory stats for device %s: %s. ", device,
-                    e)
+    if jax.process_count() == 1:
+        # Single process: every device is addressable.
+        is_local = [True] * len(devices)
     else:
-        for device in devices:
-            hbm_used = device.memory_stats()["bytes_in_use"]
-            hbm_limit = device.memory_stats()["bytes_limit"]
-            usage.append((hbm_used, hbm_limit))
-
-    return usage
+        process_index = jax.process_index()
+        is_local = [d.process_index == process_index for d in devices]
+    usage = [
+        _local_memory_stats(device) if local else None
+        for device, local in zip(devices, is_local)
+    ]
+    if all(u is None for u in usage):
+        logger.warning(
+            "No memory stats available for devices %s; estimating HBM "
+            "usage from live arrays and the device-kind HBM limit.", devices)
+        estimate = pathways_hbm_usage_gb(devices)
+        if not any(is_local):
+            return estimate
+        usage = [e if local else None for e, local in zip(estimate, is_local)]
+    sample = next(u for u in usage if u is not None)
+    # TODO(ranlihao): find a proper way to get the memory usage of each device.
+    if any(u is None for u in usage):
+        logger.info(
+            "Memory stats unavailable for %d of %d devices (non-addressable "
+            "or unsupported); assuming they match %s.",
+            sum(u is None for u in usage), len(usage), sample)
+    return [sample if u is None else u for u in usage]
 
 
 def get_device_name(num_devices: int | None = None):
@@ -444,6 +473,65 @@ def make_optimized_mesh(axis_shapes: Sequence[int],
                              axis_names,
                              axis_types=(mesh_lib.AxisType.Auto, ) *
                              len(axis_shapes))
+
+
+def attn_dp_ring_device_mesh(mesh_shape: Sequence[int],
+                             axis_names: Sequence[str],
+                             devices: Sequence[Any]) -> np.ndarray:
+    """Lay out an attn_dp x `model=4` mesh so each attn_dp group is a physical
+    ring, for a 2x2xZ slice of two-core chips (v7x) without wraparound.
+
+    XLA runs an attn_dp collective as a ring in the replica group's order.
+    jax's v7x layout puts attn_dp ranks 2h and 2h+1 on opposite corners of
+    host h's 2x2 chips, causing suboptimal performance on collectives. Here:
+      - attn_dp rank r sits at (x, z) = ring[r], where the ring goes up
+        z at x=0 and back down at x=1, so every step is one link;
+      - model index m sits at y = m // 2, core m % 2, so the two cores of a
+        chip are model indices 2k, 2k+1 (as the hierarchical MoE dispatch
+        and collect require) and the two chips of a model group are linked.
+
+    The cost: in a 2xZ grid of chip pairs the only ring of single links is
+    its outer edge, so host z holds attn_dp ranks z and 2Z-1-z, which are
+    not adjacent. On more than one host, a host's devices are then not a
+    contiguous block of the mesh, so jax's Mesh.local_mesh and the
+    host-local array helpers in multihost_utils fail, and RL weight sync
+    reports no host_subgrid.
+
+    Returns the devices reshaped to mesh_shape. Raises ValueError with the
+    reason when the mesh or the devices don't fit.
+    """
+    shape = dict(zip(axis_names, mesh_shape))
+    dp = shape["attn_dp"]
+    if dp % 2 or shape["model"] != 4 or any(
+            size > 1 for name, size in shape.items()
+            if name not in ("attn_dp", "model")):
+        raise ValueError(f"it needs an even attn_dp, model=4 and no other "
+                         f"axis above 1, got {shape}")
+    if not all(
+            hasattr(d, "coords") and hasattr(d, "core_on_chip")
+            for d in devices):
+        raise ValueError("the devices report no coords/core_on_chip")
+
+    # Key the devices by (x, y, z, core) from the slice's lowest corner, as
+    # they may be part of a larger slice (e.g. one host's devices under PP).
+    num_z = dp // 2
+    xs, ys, zs = zip(*(d.coords for d in devices))
+    x0, y0, z0 = min(xs), min(ys), min(zs)
+    pos = {}
+    for d in devices:
+        x, y, z = d.coords
+        pos[x - x0, y - y0, z - z0, d.core_on_chip] = d
+    if len(devices) != 8 * num_z or pos.keys() != set(
+            itertools.product(range(2), range(2), range(num_z), range(2))):
+        chips = "x".join(str(max(c) - min(c) + 1) for c in (xs, ys, zs))
+        raise ValueError(f"attn_dp={dp} needs both cores of every chip of a "
+                         f"2x2x{num_z} slice, got {len(devices)} devices on "
+                         f"a {chips} chip grid")
+
+    ring = [(0, z) for z in range(num_z)] + [(1, z)
+                                             for z in reversed(range(num_z))]
+    grid = [[pos[x, m // 2, z, m % 2] for m in range(4)] for x, z in ring]
+    return np.array(grid, dtype=object).reshape(mesh_shape)
 
 
 def device_array(mesh: Mesh, *args, sharding=None, **kwargs) -> jax.Array:

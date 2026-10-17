@@ -21,7 +21,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from tpu_inference.kernels.gdn.v3 import wrapper
+from tpu_inference.layers.common.attention_backend import (
+    Conv1dGDNKernel, GDNLinearAttentionBackend)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
 
@@ -49,6 +50,7 @@ def run_jax_gdn_attention(
     slot_read_offsets: Optional[jnp.ndarray] = None,
     num_spec_tokens: int = 0,
     read_state_indices: Optional[jnp.ndarray] = None,
+    conv1d_gdn_kernel: Optional[Conv1dGDNKernel] = None,
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
@@ -94,6 +96,8 @@ def run_jax_gdn_attention(
           prefix caching passes a different slot here, since a request
           resumes from the cached state block of the last block boundary and
           checkpoints into the block covering its current position.
+        conv1d_gdn_kernel: The linear attention backend's fused conv1d + GDN
+          kernel. Defaults to the GDN v3 kernel.
 
     Returns:
         A tuple containing:
@@ -154,7 +158,8 @@ def run_jax_gdn_attention(
             # `state_indices` are rank-local base slots; `slot_read_offsets`
             # is the rank-local shard of the per-slot offset buffer.
             read_offsets = slot_read_offsets[state_indices]
-        return wrapper.fused_conv1d_gdn(
+        return (conv1d_gdn_kernel
+                or GDNLinearAttentionBackend().conv1d_gdn_kernel())(
             j_mixed_qkv, j_b, j_a, conv_state, recurrent_state,
             j_conv_weight, j_conv_bias, j_A_log, j_dt_bias,
             query_start_loc, state_indices, distribution, seq_lens,
